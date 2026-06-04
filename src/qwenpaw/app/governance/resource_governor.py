@@ -82,7 +82,7 @@ class ResourceGovernor:
         """将内存审计事件写入 audit.jsonl。"""
         if self._audit_log is None:
             return
-        events = self._audit_log._events
+        events = self._audit_log.drain_events()
         if not events:
             return
         audit_path = self.workspace_dir / "audit_log" / "audit.jsonl"
@@ -123,13 +123,8 @@ class ResourceGovernor:
         decision = self.policy.evaluate(
             tool_call.tool_name, tool_call.target,
             tool_call.agent_id, tool_call.session_id,
+            workspace_dir=str(self.workspace_dir),
         )
-        # workspace 内 Read/Grep/Glob 无命中规则 → 默认允许（不需 approve）
-        if decision == PolicyDecision.ASK and tool_call.tool_name in (
-            "Read", "Grep", "Glob",
-        ):
-            if self._is_within_workspace(tool_call.target):
-                decision = PolicyDecision.ALLOW
         # 审计记录
         if self._audit_log:
             self._audit_log.record(tool_call, decision)
@@ -234,19 +229,6 @@ class ResourceGovernor:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _is_within_workspace(self, target: str) -> bool:
-        """判断 target 路径是否在 workspace_dir 范围内。"""
-        if not target or target == "*":
-            return False
-        target_path = Path(target)
-        if not target_path.is_absolute():
-            target_path = self.workspace_dir / target_path
-        try:
-            resolved = target_path.resolve()
-            ws_resolved = self.workspace_dir.resolve()
-            return str(resolved).startswith(str(ws_resolved) + "/") or resolved == ws_resolved
-        except (OSError, ValueError):
-            return False
 
 
 # ---------------------------------------------------------------------------

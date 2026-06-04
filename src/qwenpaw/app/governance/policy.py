@@ -98,7 +98,7 @@ class PolicyRule:
 
 # tool 类型判断：如果 policy 中出现 "ToolName(...)" 且 ToolName 在此集合中，
 # 则该 tool call 的 "无命中 fallback" 是 sandbox；否则是 ask。
-SANDBOX_TOOLS = {"Bash", "Python", "Node", "Shell"}
+SANDBOX_TOOLS = {"Bash"}
 
 
 @dataclass
@@ -119,13 +119,15 @@ class GovernancePolicy:
     # ------------------------------------------------------------------
 
     def evaluate(self, tool_name: str, target: str,
-                 agent_id: str, session_id: str = "") -> PolicyDecision:
+                 agent_id: str, session_id: str = "",
+                 workspace_dir: Optional[str] = None) -> PolicyDecision:
         """对一次 tool call 进行策略裁决。
 
         评估逻辑（first-match-wins）：
             1. 按顺序遍历 rules
             2. 第一条匹配的 rule 决定 action
             3. 无命中 → 根据 tool 类型决定 fallback:
+               - Read/Grep/Glob 且 target 在 workspace 内 → ALLOW（workspace 只读默认）
                - tool_name in SANDBOX_TOOLS → SANDBOX_FALLBACK
                - 否则 → ASK
 
@@ -134,9 +136,14 @@ class GovernancePolicy:
         for rule in self.rules:
             if rule.matches_tool_call(tool_name, target, agent_id, session_id):
                 return PolicyDecision(rule.action.value)
-        # 无命中 fallback
-        if tool_name in SANDBOX_TOOLS:
-            return PolicyDecision.SANDBOX_FALLBACK
+        # 无命中：workspace 内只读 tool 默认允许
+        if tool_name in ("Read", "Grep", "Glob") and workspace_dir:
+            if _is_within_workspace(target, workspace_dir):
+                return PolicyDecision.ALLOW
+        # FOR TEST
+        # # 无命中 fallback
+        # if tool_name in SANDBOX_TOOLS:
+        #     return PolicyDecision.SANDBOX_FALLBACK
         return PolicyDecision.ASK
 
     # ------------------------------------------------------------------
@@ -160,6 +167,21 @@ class GovernancePolicy:
 # ---------------------------------------------------------------------------
 # 辅助函数
 # ---------------------------------------------------------------------------
+
+def _is_within_workspace(target: str, workspace_dir: str) -> bool:
+    """判断 target 路径是否在 workspace_dir 范围内。"""
+    if not target or target == "*":
+        return False
+    target_path = Path(target)
+    if not target_path.is_absolute():
+        target_path = Path(workspace_dir) / target_path
+    try:
+        resolved = target_path.resolve()
+        ws_resolved = Path(workspace_dir).resolve()
+        return str(resolved).startswith(str(ws_resolved) + "/") or resolved == ws_resolved
+    except (OSError, ValueError):
+        return False
+
 
 def _parse_match(match_str: str) -> tuple:
     """解析 "ToolName(pattern)" → (tool_name, pattern)。

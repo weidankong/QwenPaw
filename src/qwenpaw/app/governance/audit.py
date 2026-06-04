@@ -56,6 +56,12 @@ class AuditLog:
         )
         self._events.append(event)
 
+    def drain_events(self) -> List[AuditEvent]:
+        """取出所有事件并清空内存列表（供 flush 使用）。"""
+        events = self._events
+        self._events = []
+        return events
+
     def query(
         self,
         agent_id: Optional[str] = None,

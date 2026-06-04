@@ -42,8 +42,6 @@ _TOOL_NAME_OVERRIDES = {
     "submit_to_agent": "SubmitToAgent",
     "check_agent_task": "CheckAgentTask",
     "materialize_skill": "MaterializeSkill",
-    "lsp": "LSP",
-    "ast_search": "ASTSearch",
 }
 
 
@@ -73,12 +71,9 @@ _TARGET_PARAM_MAP: dict[str, str] = {
     "ViewImage": "file_path",
     "ViewVideo": "file_path",
     "Bash": "command",
-    "Shell": "command",
     "Grep": "pattern",
     "Glob": "pattern",
-    "ASTSearch": "pattern",
     "Browser": "url",
-    "LSP": "file_path",
     "SetUserTimezone": "timezone",
     "DelegateExternalAgent": "agent_id",
     "ListAgents": "",
@@ -99,9 +94,9 @@ def _extract_target(policy_tool_name: str, input_data: dict) -> str:
     """
     param = _TARGET_PARAM_MAP.get(policy_tool_name, "")
     if not param:
-        return "*"
+        return ""
     target = input_data.get(param, "")
-    return str(target) if target else "*"
+    return str(target) if target else ""
 
 
 # ---------------------------------------------------------------------------
