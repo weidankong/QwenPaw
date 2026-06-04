@@ -59,6 +59,7 @@ from .tools import (
 from ..constant import (
     MEDIA_UNSUPPORTED_PLACEHOLDER,
     WORKING_DIR,
+    USE_WORKSPACE_V2_POLICY,
 )
 from ..providers.model_capability_cache import get_capability_cache
 
@@ -136,6 +137,24 @@ class QwenPawAgent(CodingModeMixin, Agent):
         except Exception:  # pylint: disable=broad-except
             effective_skills = []
 
+        # Initialize workspace_v2 (feature flag controlled)
+        self._workspace = None
+        if USE_WORKSPACE_V2_POLICY:
+            try:
+                from ..app.workspace_v2 import Workspace
+                self._workspace = Workspace(str(workspace_dir))
+                self._workspace.start()
+                logger.info(
+                    "Workspace v2 started: dir=%s",
+                    workspace_dir,
+                )
+            except Exception:  # pylint: disable=broad-except
+                logger.warning(
+                    "Failed to start workspace v2; falling back to "
+                    "GuardedFunctionTool",
+                    exc_info=True,
+                )
+
         # Initialize toolkit with built-in tools
         toolkit = self._create_toolkit(
             effective_skills=effective_skills,
@@ -189,22 +208,32 @@ class QwenPawAgent(CodingModeMixin, Agent):
         # its own GuardedFunctionTool.check_permissions for tool-guard.
         # Without this, MCP tools (which have no check_permissions override)
         # fall through to the default "ask" behavior, blocking execution.
-        from agentscope.permission import PermissionMode
+        # from agentscope.permission import PermissionMode
 
-        self.state.permission_context.mode = PermissionMode.BYPASS
+        # self.state.permission_context.mode = PermissionMode.BYPASS
 
         # Register memory tools provided by the memory manager
         if self.memory_manager is not None:
             memory_tools = self.memory_manager.list_memory_tools()
             basic_group = self.toolkit.tool_groups[0]
             for tool_fn in memory_tools:
-                basic_group.tools.append(
-                    GuardedFunctionTool(
-                        tool_fn,
-                        agent_id=self._agent_config.id,
-                        request_context=self._request_context,
-                    ),
-                )
+                if self._use_workspace_v2_policy():
+                    from ..app.workspace_v2 import PolicyGuardedTool
+                    basic_group.tools.append(
+                        PolicyGuardedTool(
+                            tool_fn,
+                            workspace=self._workspace,
+                            request_context=self._request_context,
+                        ),
+                    )
+                else:
+                    basic_group.tools.append(
+                        GuardedFunctionTool(
+                            tool_fn,
+                            agent_id=self._agent_config.id,
+                            request_context=self._request_context,
+                        ),
+                    )
             logger.debug(
                 "Registered memory tools: %s",
                 [fn.__name__ for fn in memory_tools],
@@ -280,6 +309,10 @@ class QwenPawAgent(CodingModeMixin, Agent):
             raise KeyError(
                 "state_dict has neither 'state' nor 'memory' key",
             )
+
+    def _use_workspace_v2_policy(self) -> bool:
+        """Return True when workspace_v2 policy should be used."""
+        return USE_WORKSPACE_V2_POLICY and self._workspace is not None
 
     def _create_toolkit(
         self,
@@ -374,13 +407,23 @@ class QwenPawAgent(CodingModeMixin, Agent):
                 logger.debug("Skipped disabled tool: %s", tool_name)
                 continue
 
-            tool_instances.append(
-                GuardedFunctionTool(
-                    tool_func,
-                    agent_id=agent_id,
-                    request_context=self._request_context,
-                ),
-            )
+            if self._use_workspace_v2_policy():
+                from ..app.workspace_v2 import PolicyGuardedTool
+                tool_instances.append(
+                    PolicyGuardedTool(
+                        tool_func,
+                        workspace=self._workspace,
+                        request_context=self._request_context,
+                    ),
+                )
+            else:
+                tool_instances.append(
+                    GuardedFunctionTool(
+                        tool_func,
+                        agent_id=agent_id,
+                        request_context=self._request_context,
+                    ),
+                )
             logger.debug("Registered tool: %s", tool_name)
 
         # Coding Mode tools (lsp, ast_search)
@@ -465,6 +508,15 @@ class QwenPawAgent(CodingModeMixin, Agent):
             sys_prompt = sys_prompt + "\n\n" + self._env_context
 
         return sys_prompt
+
+    async def close(self) -> None:
+        """Shut down workspace v2 (flush audit log, persist policy)."""
+        ws = getattr(self, "_workspace", None)
+        if ws is not None:
+            try:
+                ws.stop()
+            except Exception:
+                logger.debug("workspace_v2 stop failed", exc_info=True)
 
     def _build_middlewares(self) -> list:
         """Build the middleware list for the agent constructor."""

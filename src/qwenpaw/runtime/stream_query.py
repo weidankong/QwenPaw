@@ -816,3 +816,14 @@ class Runner:
                 "stream_query: failed to persist session state",
                 exc_info=True,
             )
+
+        # Shut down workspace v2 (flush audit log, persist dynamic policy).
+        try:
+            agent_close = getattr(agent, "close", None)
+            if agent_close is not None:
+                await agent_close()
+        except Exception:
+            logger.debug(
+                "stream_query: agent close failed",
+                exc_info=True,
+            )

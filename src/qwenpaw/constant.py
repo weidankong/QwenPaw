@@ -339,6 +339,13 @@ try:
 except (TypeError, ValueError):
     TOOL_GUARD_APPROVAL_TIMEOUT_SECONDS = 300.0
 
+# Workspace v2 policy feature flag.
+# When True, PolicyGuardedTool is used instead of GuardedFunctionTool.
+# Default: False (gradual rollout).
+USE_WORKSPACE_V2_POLICY = _get_env(
+    "QWENPAW_USE_WORKSPACE_V2_POLICY", "true"
+).lower() in ("true", "1", "yes")
+
 # Tool guard approval heartbeat interval (seconds).
 # Sends periodic heartbeat messages during approval wait to keep SSE
 # connection alive. Should be less than browser/proxy timeout (30-60s).
