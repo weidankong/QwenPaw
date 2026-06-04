@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Workspace — 策略评估 + 审计记录 + sandbox config 编译。
+"""Resource Governor — 策略评估 + 审计记录 + sandbox config 编译。
 
 设计决策（2025-06-02）：
-- Workspace 核心职责：策略评估、审计记录、动态追加规则、编译 sandbox config。
+- ResourceGovernor 核心职责：策略评估、审计记录、动态追加规则、编译 sandbox config。
 - assert_and_audit 接收 tool_call，返回 PolicyDecision。
 - compile_sandbox_config 根据 policy 中 allow 规则编译出 SandboxConfig。
 - Registry 和生命周期管理保留但不展开（与 runtime 有重叠）。
@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Optional
 
 from .policy import (
-    WorkspacePolicy, PolicyRule, PolicyAction, PolicyDecision,
-    SANDBOX_TOOLS, load_workspace_policy, save_workspace_policy,
+    GovernancePolicy, PolicyRule, PolicyAction, PolicyDecision,
+    SANDBOX_TOOLS, load_governance_policy, save_governance_policy,
 )
 from .audit import AuditLog
 
@@ -41,8 +41,8 @@ class ToolCall:
         self.session_id = session_id
 
 
-class Workspace:
-    """Workspace — 策略与审计的核心。
+class ResourceGovernor:
+    """ResourceGovernor — 策略与审计的核心。
 
     职责：
         1. 策略评估：assert_and_audit(tool_call) → PolicyDecision
@@ -59,7 +59,7 @@ class Workspace:
         self.workspace_dir = Path(workspace_dir)
         # policy 存储在 workspace 外的独立路径，防止 agent 改写
         self._policy_dir = Path.home() / ".qwenpaw" / "policies" / self.workspace_dir.name
-        self._policy: Optional[WorkspacePolicy] = None
+        self._policy: Optional[GovernancePolicy] = None
         self._audit_log: Optional[AuditLog] = None
 
     # ------------------------------------------------------------------
@@ -69,14 +69,14 @@ class Workspace:
     def start(self) -> None:
         """加载 policy、初始化 audit log。"""
         self._policy_dir.mkdir(parents=True, exist_ok=True)
-        self._policy = load_workspace_policy(str(self._policy_dir))
+        self._policy = load_governance_policy(str(self._policy_dir))
         self._audit_log = AuditLog(str(self.workspace_dir))
 
     def stop(self) -> None:
         """flush audit log 到磁盘，持久化 policy（如有变更）。"""
         self._flush_audit_log()
         if self._policy and self._policy.rules:
-            save_workspace_policy(self._policy, str(self._policy_dir))
+            save_governance_policy(self._policy, str(self._policy_dir))
 
     def _flush_audit_log(self) -> None:
         """将内存审计事件写入 audit.jsonl。"""
@@ -212,22 +212,22 @@ class Workspace:
         并持久化到 policy.yaml中。
         """
         self.policy.add_rule(rule)
-        save_workspace_policy(self._policy, str(self._policy_dir))
+        save_governance_policy(self._policy, str(self._policy_dir))
 
     # ------------------------------------------------------------------
     # 属性访问
     # ------------------------------------------------------------------
 
     @property
-    def policy(self) -> WorkspacePolicy:
+    def policy(self) -> GovernancePolicy:
         if self._policy is None:
-            raise RuntimeError("Workspace not started")
+            raise RuntimeError("ResourceGovernor not started")
         return self._policy
 
     @property
     def audit_log(self) -> AuditLog:
         if self._audit_log is None:
-            raise RuntimeError("Workspace not started")
+            raise RuntimeError("ResourceGovernor not started")
         return self._audit_log
 
     # ------------------------------------------------------------------

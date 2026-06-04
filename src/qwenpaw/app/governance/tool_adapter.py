@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""PolicyGuardedTool — workspace_v2 策略检查的 tool wrapper。
+"""PolicyGuardedTool — governance 策略检查的 tool wrapper。
 
 替代现有的 GuardedFunctionTool。每次 tool 调用走两层：
-1. check_permissions: 预执行裁决 — ToolCall → workspace.assert_and_audit()
+1. check_permissions: 预执行裁决 — ToolCall → governor.assert_and_audit()
 2. __call__: 实际执行 — 处理 sandbox violation retry loop
 """
 from __future__ import annotations
@@ -109,10 +109,10 @@ def _extract_target(policy_tool_name: str, input_data: dict) -> str:
 # ---------------------------------------------------------------------------
 
 class PolicyGuardedTool:
-    """workspace_v2 策略检查的 tool wrapper。
+    """governance 策略检查的 tool wrapper。
 
     动态继承 FunctionTool，实现：
-    - check_permissions: 调用 workspace.assert_and_audit() 做裁决
+    - check_permissions: 调用 governor.assert_and_audit() 做裁决
     - __call__: 重写以处理 sandbox execution + violation retry
     """
 
@@ -138,7 +138,7 @@ def _policy_tool_init(
     self: Any,
     func: Any,
     *,
-    workspace: Any = None,
+    governor: Any = None,
     request_context: dict[str, str] | None = None,
     **kwargs: Any,
 ) -> None:
@@ -146,7 +146,7 @@ def _policy_tool_init(
 
     FunctionTool.__init__(self, func, **kwargs)
     # pylint: disable=protected-access
-    self._qp_workspace = workspace
+    self._qp_governor = governor
     self._qp_request_context = request_context or {}
     self._qp_policy_decision = None  # 预裁决结果
     self._qp_sandbox_mode = False    # 是否在 sandbox 中执行
@@ -159,23 +159,23 @@ async def _policy_tool_check_permissions(
     *_extra_args: Any,
     **_extra_kwargs: Any,
 ) -> Any:
-    """对一次 tool 调用进行 workspace_v2 策略裁决。
+    """对一次 tool 调用进行 governance 策略裁决。
 
     流程：
         1. 构造 ToolCall(tool_name, target, agent_id, session_id)
-        2. workspace.assert_and_audit(tool_call) → PolicyDecision
+        2. governor.assert_and_audit(tool_call) → PolicyDecision
         3. 映射到 PermissionDecision
     """
     from agentscope.permission import PermissionBehavior, PermissionDecision
 
     del context
 
-    workspace = getattr(self, "_qp_workspace", None)
-    if workspace is None:
-        # Workspace 未初始化 → bypass
+    governor = getattr(self, "_qp_governor", None)
+    if governor is None:
+        # ResourceGovernor 未初始化 → bypass
         return PermissionDecision(
             behavior=PermissionBehavior.ALLOW,
-            message="PolicyGuardedTool: workspace not started — bypass.",
+            message="PolicyGuardedTool: governor not started — bypass.",
         )
 
     tool_name = _python_name_to_policy_tool_name(
@@ -189,7 +189,7 @@ async def _policy_tool_check_permissions(
         "session_id", ""
     )
 
-    from .workspace import ToolCall
+    from .resource_governor import ToolCall
 
     tool_call = ToolCall(
         tool_name=tool_name,
@@ -198,7 +198,7 @@ async def _policy_tool_check_permissions(
         session_id=session_id,
     )
 
-    decision = workspace.assert_and_audit(tool_call)
+    decision = governor.assert_and_audit(tool_call)
 
     # 缓存裁决结果供 __call__ 使用
     self._qp_policy_decision = decision
@@ -207,12 +207,12 @@ async def _policy_tool_check_permissions(
     if decision.value == "allow":
         return PermissionDecision(
             behavior=PermissionBehavior.ALLOW,
-            message="workspace_v2: tool allowed.",
+            message="governance: tool allowed.",
         )
     elif decision.value == "deny":
         return PermissionDecision(
             behavior=PermissionBehavior.DENY,
-            message=f"Tool '{tool_name}' is denied by workspace policy "
+            message=f"Tool '{tool_name}' is denied by governance policy "
             f"(target: {target}).",
         )
     elif decision.value == "sandbox_fallback":
@@ -220,13 +220,13 @@ async def _policy_tool_check_permissions(
         self._qp_sandbox_mode = True
         return PermissionDecision(
             behavior=PermissionBehavior.ALLOW,
-            message="workspace_v2: sandbox fallback.",
+            message="governance: sandbox fallback.",
         )
     elif decision.value == "ask":
         # 需要用户确认
         self._qp_policy_decision = decision
         return await _ask_user_approval(
-            workspace=workspace,
+            governor=governor,
             tool_name=tool_name,
             target=target,
             input_data=input_data,
@@ -258,7 +258,7 @@ async def _policy_tool_call(
     if sandbox_mode:
         # 目前 sandbox 未接入，直接执行
         # 后续接入 sandbox 后：
-        #   config = workspace.compile_sandbox_config(agent_id, session_id)
+        #   config = governor.compile_sandbox_config(agent_id, session_id)
         #   result = sandbox.execute(func, args, kwargs, config)
         #   if result.violation:
         #       return await _handle_sandbox_violation(...)
@@ -278,7 +278,7 @@ async def _policy_tool_call(
 # ---------------------------------------------------------------------------
 
 async def _ask_user_approval(
-    workspace: Any,
+    governor: Any,
     tool_name: str,
     target: str,
     input_data: dict,
@@ -321,15 +321,15 @@ async def _ask_user_approval(
                 title="Policy Approval Required",
                 description=(
                     f"Tool '{tool_name}' with target '{target}' "
-                    f"requires user approval per workspace policy."
+                    f"requires user approval per governance policy."
                 ),
                 tool_name=tool_name,
                 remediation="Approve or deny this tool call",
-                guardian="workspace_policy",
+                guardian="governance_policy",
                 metadata={"target": target},
             ),
         ],
-        guardians_used=["workspace_policy"],
+        guardians_used=["governance_policy"],
     )
 
     svc = get_approval_service()
@@ -380,7 +380,7 @@ async def _ask_user_approval(
 
     summary = format_findings_summary(guard_result)
     if decision == ApprovalDecision.APPROVED:
-        # 追加一条 allow 规则到 workspace policy，下次免问
+        # 追加一条 allow 规则到 governance policy，下次免问
         try:
             rule = PolicyRule(
                 match=f"{tool_name}({target})",
@@ -389,7 +389,7 @@ async def _ask_user_approval(
                 duration="session",
                 session_id=session_id,
             )
-            workspace.add_rule(rule)
+            governor.add_rule(rule)
             logger.info(
                 "PolicyGuardedTool: added approved rule: %s",
                 rule.match,

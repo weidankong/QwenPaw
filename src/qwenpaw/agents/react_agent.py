@@ -59,7 +59,6 @@ from .tools import (
 from ..constant import (
     MEDIA_UNSUPPORTED_PLACEHOLDER,
     WORKING_DIR,
-    USE_WORKSPACE_V2_POLICY,
 )
 from ..providers.model_capability_cache import get_capability_cache
 
@@ -137,23 +136,22 @@ class QwenPawAgent(CodingModeMixin, Agent):
         except Exception:  # pylint: disable=broad-except
             effective_skills = []
 
-        # Initialize workspace_v2 (feature flag controlled)
-        self._workspace = None
-        if USE_WORKSPACE_V2_POLICY:
-            try:
-                from ..app.workspace_v2 import Workspace
-                self._workspace = Workspace(str(workspace_dir))
-                self._workspace.start()
-                logger.info(
-                    "Workspace v2 started: dir=%s",
-                    workspace_dir,
-                )
-            except Exception:  # pylint: disable=broad-except
-                logger.warning(
-                    "Failed to start workspace v2; falling back to "
-                    "GuardedFunctionTool",
-                    exc_info=True,
-                )
+        # Initialize governance (feature flag controlled)
+        self._governor = None
+        try:
+            from ..app.governance import ResourceGovernor
+            self._governor = ResourceGovernor(str(workspace_dir))
+            self._governor.start()
+            logger.info(
+                "Governance started: dir=%s",
+                workspace_dir,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning(
+                "Failed to start governance; falling back to "
+                "GuardedFunctionTool",
+                exc_info=True,
+            )
 
         # Initialize toolkit with built-in tools
         toolkit = self._create_toolkit(
@@ -217,12 +215,12 @@ class QwenPawAgent(CodingModeMixin, Agent):
             memory_tools = self.memory_manager.list_memory_tools()
             basic_group = self.toolkit.tool_groups[0]
             for tool_fn in memory_tools:
-                if self._use_workspace_v2_policy():
-                    from ..app.workspace_v2 import PolicyGuardedTool
+                if self._use_governance_policy():
+                    from ..app.governance import PolicyGuardedTool
                     basic_group.tools.append(
                         PolicyGuardedTool(
                             tool_fn,
-                            workspace=self._workspace,
+                            governor=self._governor,
                             request_context=self._request_context,
                         ),
                     )
@@ -310,9 +308,9 @@ class QwenPawAgent(CodingModeMixin, Agent):
                 "state_dict has neither 'state' nor 'memory' key",
             )
 
-    def _use_workspace_v2_policy(self) -> bool:
-        """Return True when workspace_v2 policy should be used."""
-        return USE_WORKSPACE_V2_POLICY and self._workspace is not None
+    def _use_governance_policy(self) -> bool:
+        """Return True when governance policy should be used."""
+        return self._governor is not None
 
     def _create_toolkit(
         self,
@@ -407,12 +405,12 @@ class QwenPawAgent(CodingModeMixin, Agent):
                 logger.debug("Skipped disabled tool: %s", tool_name)
                 continue
 
-            if self._use_workspace_v2_policy():
-                from ..app.workspace_v2 import PolicyGuardedTool
+            if self._use_governance_policy():
+                from ..app.governance import PolicyGuardedTool
                 tool_instances.append(
                     PolicyGuardedTool(
                         tool_func,
-                        workspace=self._workspace,
+                        governor=self._governor,
                         request_context=self._request_context,
                     ),
                 )
@@ -510,13 +508,13 @@ class QwenPawAgent(CodingModeMixin, Agent):
         return sys_prompt
 
     async def close(self) -> None:
-        """Shut down workspace v2 (flush audit log, persist policy)."""
-        ws = getattr(self, "_workspace", None)
-        if ws is not None:
+        """Shut down governor (flush audit log, persist policy)."""
+        gov = getattr(self, "_governor", None)
+        if gov is not None:
             try:
-                ws.stop()
+                gov.stop()
             except Exception:
-                logger.debug("workspace_v2 stop failed", exc_info=True)
+                logger.debug("governor stop failed", exc_info=True)
 
     def _build_middlewares(self) -> list:
         """Build the middleware list for the agent constructor."""

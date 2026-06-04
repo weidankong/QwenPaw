@@ -13,7 +13,6 @@ import logging
 from pathlib import Path
 
 from ..constant import WORKING_DIR
-from ..constant import USE_WORKSPACE_V2_POLICY
 from ..runtime import GuardedFunctionTool
 from .tools import ast_tool
 from .tools._lsp_servers import detect_available_lsp_languages
@@ -214,12 +213,9 @@ class CodingModeMixin:
             return False
         return bool(getattr(cm, "enabled", False))
 
-    def _should_use_workspace_v2(self) -> bool:
-        """Return True when workspace_v2 policy should be used."""
-        if not USE_WORKSPACE_V2_POLICY:
-            return False
-        workspace = getattr(self, "_workspace", None)
-        return workspace is not None
+    def _should_use_governance(self) -> bool:
+        """Return True."""
+        return True
 
     # ------------------------------------------------------------------
     # Tool registration hook (called from QwenPawAgent._create_toolkit)
@@ -248,12 +244,12 @@ class CodingModeMixin:
         try:
             available = detect_available_lsp_languages(project_dir)
             if available:
-                if self._should_use_workspace_v2():
-                    from ..app.workspace_v2 import PolicyGuardedTool
+                if self._should_use_governance():
+                    from ..app.governance import PolicyGuardedTool
                     result.append(
                         PolicyGuardedTool(
                             make_lsp_tool(available),
-                            workspace=self._workspace,
+                            governor=self._governor,
                             request_context=request_context,
                         ),
                     )
@@ -280,12 +276,12 @@ class CodingModeMixin:
 
         try:
             if ast_tool.is_ast_grep_available():
-                if self._should_use_workspace_v2():
-                    from ..app.workspace_v2 import PolicyGuardedTool
+                if self._should_use_governance():
+                    from ..app.governance import PolicyGuardedTool
                     result.append(
                         PolicyGuardedTool(
                             ast_tool.ast_search,
-                            workspace=self._workspace,
+                            governor=self._governor,
                             request_context=request_context,
                         ),
                     )

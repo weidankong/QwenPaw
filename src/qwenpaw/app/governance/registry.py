@@ -22,7 +22,7 @@ class ResourceRecord:
 class ResourceRegistry:
     """资源注册表（保留，不展开）。
 
-    由 Workspace 持有，记录 workspace 中有哪些受治理的资源。
+    由 ResourceGovernor 持有，记录 workspace 中有哪些受治理的资源。
     与 runtime 的边界划分待讨论。
     """
 

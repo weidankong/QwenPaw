@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""WorkspacePolicy — unified PolicyRule model (first-match-wins).
+"""GovernancePolicy — unified PolicyRule model (first-match-wins).
 
 设计决策（2025-06-02）：
 - grant 和 rule 统一为 PolicyRule，一个引擎、一种数据结构。
@@ -102,10 +102,10 @@ SANDBOX_TOOLS = {"Bash", "Python", "Node", "Shell"}
 
 
 @dataclass
-class WorkspacePolicy:
+class GovernancePolicy:
     """统一策略：PolicyRule 列表 + first-match-wins。
 
-    加载自 policy_dir/policy.yaml，由 Workspace 持有。
+    加载自 policy_dir/policy.yaml，由 ResourceGovernor 持有。
 
     生命周期：
         load → evaluate（热路径）→ add_rule（用户 approve）→ save
@@ -180,7 +180,7 @@ def _parse_match(match_str: str) -> tuple:
 # 加载 / 持久化
 # ---------------------------------------------------------------------------
 
-def load_workspace_policy(policy_dir: str) -> WorkspacePolicy:
+def load_governance_policy(policy_dir: str) -> GovernancePolicy:
     """从 policy_dir/policy.yaml 加载；缺失时返回空 policy。
 
     YAML 格式：
@@ -200,16 +200,16 @@ def load_workspace_policy(policy_dir: str) -> WorkspacePolicy:
 
     path = Path(policy_dir) / "policy.yaml"
     if not path.exists():
-        return WorkspacePolicy()
+        return GovernancePolicy()
 
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
     except Exception:
-        return WorkspacePolicy()
+        return GovernancePolicy()
 
     if not isinstance(data, dict):
-        return WorkspacePolicy()
+        return GovernancePolicy()
 
     rules = []
     for item in data.get("rules", []) or []:
@@ -228,14 +228,14 @@ def load_workspace_policy(policy_dir: str) -> WorkspacePolicy:
             session_id=item.get("session_id"),
         ))
 
-    return WorkspacePolicy(
+    return GovernancePolicy(
         version=data.get("version", "1.0"),
         rules=rules,
         audit_level=data.get("audit_level", "all"),
     )
 
 
-def save_workspace_policy(policy: WorkspacePolicy, policy_dir: str) -> None:
+def save_governance_policy(policy: GovernancePolicy, policy_dir: str) -> None:
     """原子写入 policy.yaml（先写 .tmp 再 rename）。"""
     import tempfile
     import yaml

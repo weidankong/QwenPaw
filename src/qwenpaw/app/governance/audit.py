@@ -31,7 +31,7 @@ class AuditEvent:
 class AuditLog:
     """追加式审计日志。
 
-    由 Workspace 持有，每次 assert_and_audit 调用 record()。
+    由 ResourceGovernor 持有，每次 assert_and_audit 调用 record()。
     """
 
     def __init__(self, workspace_dir: str):
