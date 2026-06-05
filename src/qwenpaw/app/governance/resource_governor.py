@@ -112,20 +112,13 @@ class ResourceGovernor:
     # 核心接口 2：编译 sandbox config
     # ------------------------------------------------------------------
 
-    def compile_sandbox_config(self, agent_id: str, session_id: str):
-        """根据当前 policy 中该 agent 的所有 allow 规则，
+    def compile_sandbox_config(
+        self, tool_call: ToolCall,
+    ):
+        """根据当前 policy 中与 tool_call 匹配的 allow 规则，
         编译出 sandbox 可执行的权限配置（目录级白名单）。
 
-        返回 SandboxConfig dataclass（来自 qwenpaw.sandbox.config）。
-
-        编译逻辑：
-            - 遍历 policy.rules 中 grantee 匹配的 allow 规则
-            - 提取路径级权限 → mounts
-            - 提取网络权限 → network_allow
-            - 设置 timeout、env_vars 等
-
-        注意：sandbox 的粒度是目录/文件路径白名单，
-        做不到文件类型级别（如 "只允许 .py"）。
+        只有 rule.matches_tool_call(tool_call) 为 True 的规则才贡献资源。
         """
         from qwenpaw.sandbox.config import (
             MountSpec, SandboxConfig, detect_platform_mode,
@@ -134,35 +127,78 @@ class ResourceGovernor:
         mounts = []
         seen_paths = set()
 
+        # 1. workspace_dir 始终加入 mounts（可读写）
+        ws = str(self.workspace_dir)
+        mounts.append(MountSpec(path=ws, writable=True))
+        seen_paths.add(".")
+
+        # 2. 从匹配的 allow 规则中提取额外路径
         for rule in self._policy.rules if self._policy else []:
-            if rule.grantee != "*" and rule.grantee != agent_id:
+            if rule.grantee != "*" and rule.grantee != tool_call.agent_id:
                 continue
             if rule.action != PolicyAction.ALLOW:
                 continue
-
-            # 从 "ToolName(pattern)" 提取路径 pattern
-            rule_tool, rule_pattern = _parse_match_from_rule(rule)
-            # 只处理文件类 tool 的路径（Read, Write, Edit 等）
-            if rule_tool in SANDBOX_TOOLS:
+            if not rule.matches_tool_call(
+                tool_call.tool_name, tool_call.target,
+                tool_call.agent_id, tool_call.session_id,
+            ):
                 continue
 
-            # 将 glob pattern 转为 sandbox mount 路径
-            # 支持的模式：Read(src/**) → mount src/
-            #           Write(.env*) → mount 目录级（取 prefix）
+            rule_tool, rule_pattern = _parse_match_from_rule(rule)
             mount_path = _glob_to_mount_path(rule_pattern)
-            if mount_path and mount_path not in seen_paths:
-                seen_paths.add(mount_path)
-                resolved = self.workspace_dir / mount_path
-                mounts.append(MountSpec(
-                    path=str(resolved),
-                    writable=rule_tool not in ("Read", "Grep", "Glob"),
-                ))
+            if not mount_path or mount_path in seen_paths:
+                continue
+            seen_paths.add(mount_path)
+
+            resolved = self.workspace_dir / mount_path
+            # workspace 内路径跳过（已被 workspace mount 覆盖）
+            try:
+                resolved_resolved = resolved.resolve()
+                ws_resolved = self.workspace_dir.resolve()
+                if str(resolved_resolved).startswith(str(ws_resolved) + "/") or resolved_resolved == ws_resolved:
+                    continue
+            except (OSError, ValueError):
+                pass
+
+            mounts.append(MountSpec(
+                path=str(resolved),
+                writable=rule_tool not in ("Read", "Grep", "Glob"),
+            ))
 
         return SandboxConfig(
             mode=detect_platform_mode(),
-            workspace_dir=str(self.workspace_dir),
+            workspace_dir=ws,
             mounts=mounts,
-            network_allow=[],  # 从 policy 中扩展
+            deny_paths=[
+                # SSH 密钥和配置
+                "~/.ssh",
+                # AWS 凭证
+                "~/.aws",
+                # GPG 密钥
+                "~/.gnupg",
+                # Kubernetes 配置
+                "~/.kube",
+                # Google Cloud 凭证
+                "~/.config/gcloud",
+                # Docker 认证
+                "~/.docker/config.json",
+                # 通用环境变量文件
+                "~/.env",
+                "~/.claude",
+                # macOS Keychain 数据库
+                "~/Library/Keychains",
+                # 浏览器凭据
+                "~/Library/Application Support/Google/Chrome/Default/Login Data",
+                "~/Library/Application Support/Firefox/Profiles",
+                # Git 凭据
+                "~/.git-credentials",
+                # Terraform 状态（可能含敏感信息）
+                "~/.terraformrc",
+                # 其他常见敏感配置
+                "~/.config/gh",  # GitHub CLI
+                "~/.config/nix",  # Nix 配置
+            ],
+            network_allow=["*"],
             timeout_seconds=60,
         )
 
