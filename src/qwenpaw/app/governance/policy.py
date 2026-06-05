@@ -140,10 +140,9 @@ class GovernancePolicy:
         if tool_name in ("Read", "Grep", "Glob") and workspace_dir:
             if _is_within_workspace(target, workspace_dir):
                 return PolicyDecision.ALLOW
-        # FOR TEST
-        # # 无命中 fallback
-        # if tool_name in SANDBOX_TOOLS:
-        #     return PolicyDecision.SANDBOX_FALLBACK
+        # 无命中 fallback
+        if tool_name in SANDBOX_TOOLS:
+            return PolicyDecision.SANDBOX_FALLBACK
         return PolicyDecision.ASK
 
     # ------------------------------------------------------------------

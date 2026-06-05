@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from agentscope.message import TextBlock
 from agentscope.tool import ToolChunk
@@ -364,6 +364,7 @@ async def execute_shell_command(
     command: str,
     timeout: float = 60.0,
     cwd: Optional[Path] = None,
+    sandbox_config: Optional[Any] = None,
 ) -> ToolChunk:
     """Execute a shell command and return its output.
 
@@ -384,6 +385,10 @@ async def execute_shell_command(
         cwd (`Optional[Path]`, defaults to `None`):
             The working directory for the command execution.
             If None, defaults to the agent workspace.
+        sandbox_config (`Optional[Any]`, defaults to `None`):
+            Sandbox execution configuration compiled from governance policy.
+            When provided, the command executes within a sandboxed environment
+            with the specified mount permissions and network restrictions.
 
     Returns:
         `ToolChunk`:

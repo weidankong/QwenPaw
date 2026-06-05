@@ -13,7 +13,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from .policy import PolicyRule, PolicyAction
+from .policy import PolicyRule, PolicyAction, PolicyDecision
 
 
 # ---------------------------------------------------------------------------
@@ -199,25 +199,28 @@ async def _policy_tool_check_permissions(
     self._qp_policy_decision = decision
     self._qp_sandbox_mode = False
 
-    if decision.value == "allow":
+    if decision is PolicyDecision.ALLOW:
         return PermissionDecision(
             behavior=PermissionBehavior.ALLOW,
             message="governance: tool allowed.",
         )
-    elif decision.value == "deny":
+    elif decision is PolicyDecision.DENY:
         return PermissionDecision(
             behavior=PermissionBehavior.DENY,
             message=f"Tool '{tool_name}' is denied by governance policy "
             f"(target: {target}).",
         )
-    elif decision.value == "sandbox_fallback":
+    elif decision is PolicyDecision.SANDBOX_FALLBACK:
         # Bash 类 tool 无规则命中 → 允许进入 sandbox 执行
         self._qp_sandbox_mode = True
+        self._qp_sandbox_config = governor.compile_sandbox_config(
+            agent_id, session_id
+        )
         return PermissionDecision(
             behavior=PermissionBehavior.ALLOW,
             message="governance: sandbox fallback.",
         )
-    elif decision.value == "ask":
+    elif decision is PolicyDecision.ASK:
         # 需要用户确认
         self._qp_policy_decision = decision
         return await _ask_user_approval(
@@ -246,17 +249,14 @@ async def _policy_tool_call(
 
     目前 sandbox 执行机制是 stub（后续接入真实 sandbox 后完善）。
     当前行为：
-        - sandbox_mode=True: 直接执行（等 sandbox 接入后改为在 sandbox 内执行）
+        - sandbox_mode=True: 注入 sandbox_config 到 kwargs 后直接执行
         - 其他情况：直接调原始函数
     """
     sandbox_mode = getattr(self, "_qp_sandbox_mode", False)
     if sandbox_mode:
-        # 目前 sandbox 未接入，直接执行
-        # 后续接入 sandbox 后：
-        #   config = governor.compile_sandbox_config(agent_id, session_id)
-        #   result = sandbox.execute(func, args, kwargs, config)
-        #   if result.violation:
-        #       return await _handle_sandbox_violation(...)
+        sandbox_config = getattr(self, "_qp_sandbox_config", None)
+        if sandbox_config is not None:
+            kwargs["sandbox_config"] = sandbox_config
         logger.debug(
             "PolicyGuardedTool: sandbox_mode=True for '%s' "
             "(sandbox not yet implemented, executing directly)",

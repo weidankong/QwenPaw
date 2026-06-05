@@ -74,32 +74,10 @@ class ResourceGovernor:
 
     def stop(self) -> None:
         """flush audit log 到磁盘，持久化 policy（如有变更）。"""
-        self._flush_audit_log()
+        if self._audit_log:
+            self._audit_log.flush()
         if self._policy and self._policy.rules:
             save_governance_policy(self._policy, str(self._policy_dir))
-
-    def _flush_audit_log(self) -> None:
-        """将内存审计事件写入 audit.jsonl。"""
-        if self._audit_log is None:
-            return
-        events = self._audit_log.drain_events()
-        if not events:
-            return
-        audit_path = self.workspace_dir / "audit_log" / "audit.jsonl"
-        with open(audit_path, "a", encoding="utf-8") as f:
-            for event in events:
-                f.write(json.dumps({
-                    "ts": event.ts,
-                    "agent_id": event.agent_id,
-                    "session_id": event.session_id,
-                    "tool_name": event.tool_name,
-                    "target": event.target,
-                    "decision": event.decision,
-                    "reason": event.reason,
-                    "extra": event.extra,
-                }, ensure_ascii=False) + "\n")
-        # 清空内存列表，避免下次 flush 重复写入
-        events.clear()
 
     # ------------------------------------------------------------------
     # 核心接口 1：策略评估 + 审计
@@ -138,7 +116,7 @@ class ResourceGovernor:
         """根据当前 policy 中该 agent 的所有 allow 规则，
         编译出 sandbox 可执行的权限配置（目录级白名单）。
 
-        返回 SandboxConfig dataclass。
+        返回 SandboxConfig dataclass（来自 qwenpaw.sandbox.config）。
 
         编译逻辑：
             - 遍历 policy.rules 中 grantee 匹配的 allow 规则
@@ -149,19 +127,9 @@ class ResourceGovernor:
         注意：sandbox 的粒度是目录/文件路径白名单，
         做不到文件类型级别（如 "只允许 .py"）。
         """
-        from dataclasses import dataclass
-
-        @dataclass
-        class MountSpec:
-            path: str
-            readonly: bool = False
-
-        @dataclass
-        class SandboxConfig:
-            mounts: list
-            network_allow: list
-            timeout: float = 60.0
-            env_vars: dict = None
+        from qwenpaw.sandbox.config import (
+            MountSpec, SandboxConfig, detect_platform_mode,
+        )
 
         mounts = []
         seen_paths = set()
@@ -187,13 +155,15 @@ class ResourceGovernor:
                 resolved = self.workspace_dir / mount_path
                 mounts.append(MountSpec(
                     path=str(resolved),
-                    readonly=rule_tool in ("Read", "Grep", "Glob"),
+                    writable=rule_tool not in ("Read", "Grep", "Glob"),
                 ))
 
         return SandboxConfig(
+            mode=detect_platform_mode(),
+            workspace_dir=str(self.workspace_dir),
             mounts=mounts,
             network_allow=[],  # 从 policy 中扩展
-            timeout=60.0,
+            timeout_seconds=60,
         )
 
     # ------------------------------------------------------------------

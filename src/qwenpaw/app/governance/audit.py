@@ -7,7 +7,9 @@
 - 具体格式和存储方式待后续细化（见 0602.md "待讨论"）。
 """
 from __future__ import annotations
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
 
 
@@ -35,7 +37,7 @@ class AuditLog:
     """
 
     def __init__(self, workspace_dir: str):
-        self.workspace_dir = workspace_dir
+        self.workspace_dir = Path(workspace_dir)
         self._events: List[AuditEvent] = []
 
     def record(self, tool_call, decision) -> None:
@@ -56,11 +58,26 @@ class AuditLog:
         )
         self._events.append(event)
 
-    def drain_events(self) -> List[AuditEvent]:
-        """取出所有事件并清空内存列表（供 flush 使用）。"""
-        events = self._events
-        self._events = []
-        return events
+    def flush(self) -> None:
+        """将内存审计事件写入 {workspace_dir}/audit_log/audit.jsonl 并清空。"""
+        if not self._events:
+            return
+        audit_dir = self.workspace_dir / "audit_log"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = audit_dir / "audit.jsonl"
+        events, self._events = self._events, []
+        with open(audit_path, "a", encoding="utf-8") as f:
+            for event in events:
+                f.write(json.dumps({
+                    "ts": event.ts,
+                    "agent_id": event.agent_id,
+                    "session_id": event.session_id,
+                    "tool_name": event.tool_name,
+                    "target": event.target,
+                    "decision": event.decision,
+                    "reason": event.reason,
+                    "extra": event.extra,
+                }, ensure_ascii=False) + "\n")
 
     def query(
         self,
