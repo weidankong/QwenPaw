@@ -11,10 +11,12 @@ Public surface:
 """
 from .resource_governor import ResourceGovernor, ToolCall
 from .policy import GovernancePolicy, PolicyRule, PolicyDecision, PolicyAction
+from .audit import AuditLog, AuditEvent
 from .tool_adapter import PolicyGuardedTool
 
 __all__ = [
     "ResourceGovernor", "ToolCall",
     "GovernancePolicy", "PolicyRule", "PolicyDecision", "PolicyAction",
+    "AuditLog", "AuditEvent",
     "PolicyGuardedTool",
 ]
