@@ -14,89 +14,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from .policy import PolicyRule, PolicyAction
-
-
-# ---------------------------------------------------------------------------
-# 工具名映射：python 函数名 → policy tool 名（PascalCase）
-# ---------------------------------------------------------------------------
-
-_TOOL_NAME_OVERRIDES = {
-    "execute_shell_command": "Bash",
-    "read_file": "Read",
-    "write_file": "Write",
-    "edit_file": "Edit",
-    "append_file": "Append",
-    "grep_search": "Grep",
-    "glob_search": "Glob",
-    "browser_use": "Browser",
-    "desktop_screenshot": "DesktopScreenshot",
-    "send_file_to_user": "SendFileToUser",
-    "view_image": "ViewImage",
-    "view_video": "ViewVideo",
-    "get_current_time": "GetCurrentTime",
-    "set_user_timezone": "SetUserTimezone",
-    "get_token_usage": "GetTokenUsage",
-    "delegate_external_agent": "DelegateExternalAgent",
-    "list_agents": "ListAgents",
-    "chat_with_agent": "ChatWithAgent",
-    "submit_to_agent": "SubmitToAgent",
-    "check_agent_task": "CheckAgentTask",
-    "materialize_skill": "MaterializeSkill",
-}
-
-
-def _python_name_to_policy_tool_name(name: str) -> str:
-    """将 python 函数名转为 policy tool 名。
-
-    优先查显式映射表；没有则默认 snake_case → PascalCase。
-    """
-    override = _TOOL_NAME_OVERRIDES.get(name)
-    if override:
-        return override
-    # 默认转换：snake_case → PascalCase
-    parts = name.split("_")
-    return "".join(p.capitalize() for p in parts)
-
-
-# ---------------------------------------------------------------------------
-# Target 提取映射
-# ---------------------------------------------------------------------------
-
-_TARGET_PARAM_MAP: dict[str, str] = {
-    "Read": "file_path",
-    "Write": "file_path",
-    "Edit": "file_path",
-    "Append": "file_path",
-    "SendFileToUser": "file_path",
-    "ViewImage": "file_path",
-    "ViewVideo": "file_path",
-    "Bash": "command",
-    "Grep": "pattern",
-    "Glob": "pattern",
-    "Browser": "url",
-    "SetUserTimezone": "timezone",
-    "DelegateExternalAgent": "agent_id",
-    "ListAgents": "",
-    "ChatWithAgent": "agent_id",
-    "SubmitToAgent": "agent_id",
-    "CheckAgentTask": "task_id",
-    "GetCurrentTime": "",
-    "GetTokenUsage": "",
-    "DesktopScreenshot": "",
-    "MaterializeSkill": "",
-}
-
-
-def _extract_target(policy_tool_name: str, input_data: dict) -> str:
-    """从 tool 调用参数中提取 target。
-
-    根据 policy tool 名查对应的参数名，从 input_data 中取值。
-    """
-    param = _TARGET_PARAM_MAP.get(policy_tool_name, "")
-    if not param:
-        return ""
-    target = input_data.get(param, "")
-    return str(target) if target else ""
+from .tool_registry import DEFAULT_REGISTRY
 
 
 # ---------------------------------------------------------------------------
@@ -173,11 +91,11 @@ async def _policy_tool_check_permissions(
             message="PolicyGuardedTool: governor not started — bypass.",
         )
 
-    tool_name = _python_name_to_policy_tool_name(
+    tool_name = DEFAULT_REGISTRY.python_to_policy_name(
         getattr(self, "name", "Unknown"),
     )
     input_data = input_data or {}
-    target = _extract_target(tool_name, input_data)
+    target = DEFAULT_REGISTRY.extract_target(tool_name, input_data)
 
     agent_id = getattr(self, "_qp_request_context", {}).get("agent_id", "")
     session_id = getattr(self, "_qp_request_context", {}).get(
@@ -373,27 +291,54 @@ async def _ask_user_approval(
         )
         decision = ApprovalDecision.DENIED
 
+    # 记录用户 approve/deny 结果到审计日志
+    from .resource_governor import ToolCall
+    approval_call = ToolCall(tool_name, target, agent_id, session_id)
+    approved = decision == ApprovalDecision.APPROVED
+    governor.record_approval(approval_call, approved)
+
     summary = format_findings_summary(guard_result)
     if decision == ApprovalDecision.APPROVED:
-        # 追加一条 allow 规则到 governance policy，下次免问
-        try:
-            rule = PolicyRule(
-                match=f"{tool_name}({target})",
-                action=PolicyAction.ALLOW,
-                grantee=agent_id or "*",
-                duration="session",
-                session_id=session_id,
-            )
-            governor.add_rule(rule)
-            logger.info(
-                "PolicyGuardedTool: added approved rule: %s",
-                rule.match,
-            )
-        except Exception:
-            logger.debug(
-                "PolicyGuardedTool: failed to persist approved rule",
-                exc_info=True,
-            )
+        # ──  区分 builtin ask 和 user ask ──
+        # builtin ask → 不记规则（每次都要问，保护高风险资源）
+        # user ask   → 记泛化规则（下次免问）
+        if not governor.is_builtin_ask(
+            tool_name, target, agent_id, session_id,
+        ):
+            try:
+                from .policy import generalize_rule_match
+
+                # 规则泛化（§8.2）：取首 token + *
+                generalized = generalize_rule_match(tool_name, target)
+                rule_tool, rule_pattern = generalized.split("(", 1)
+                rule_pattern = rule_pattern.rstrip(")")
+
+                # 空 pattern 保护（§8.1）：空 target 的 tool 不写规则
+                if rule_pattern:
+                    rule = PolicyRule(
+                        match=generalized,
+                        action=PolicyAction.ALLOW,
+                        reason="user approved",
+                        grantee=agent_id or "*",
+                        duration="session",
+                        session_id=session_id,
+                    )
+                    governor.add_rule(rule)
+                    logger.info(
+                        "PolicyGuardedTool: added approved rule: %s",
+                        rule.match,
+                    )
+                else:
+                    logger.debug(
+                        "PolicyGuardedTool: empty pattern, skipping rule "
+                        "for tool=%s target=%s",
+                        tool_name, target,
+                    )
+            except Exception:
+                logger.debug(
+                    "PolicyGuardedTool: failed to persist approved rule",
+                    exc_info=True,
+                )
         return PermissionDecision(
             behavior=PermissionBehavior.ALLOW,
             message=f"Approved by user.\n{summary}",

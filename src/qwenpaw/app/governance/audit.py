@@ -83,7 +83,7 @@ class AuditLog:
     def get_instance(cls) -> AuditLog:
         """获取全局单例，首次调用时初始化。"""
         if cls._instance is None:
-            db_path = Path.home() / ".qwenpaw" / "audit.db"
+            db_path = Path.home() / ".qwenpaw" / "audit" / "audit.db"
             cls._instance = cls._create(db_path)
         return cls._instance
 
@@ -110,13 +110,15 @@ class AuditLog:
             self._conn = None
         AuditLog._instance = None
 
-    def record(self, workspace_dir: str, tool_call, decision) -> None:
+    def record(self, workspace_dir: str, tool_call, decision,
+               reason: str = "") -> None:
         """记录一次裁决结果，立即写入 SQLite。
 
         Args:
             workspace_dir: 所属 workspace 路径
             tool_call: ToolCall 实例
             decision: PolicyDecision 值
+            reason: 命中规则的说明（如 "环境变量文件包含密钥/凭证"）
         """
         from datetime import datetime, timezone
         self._conn.execute(
@@ -131,7 +133,7 @@ class AuditLog:
                 tool_call.tool_name,
                 tool_call.target,
                 str(decision.value),
-                "",
+                reason,
                 "{}",
             ),
         )

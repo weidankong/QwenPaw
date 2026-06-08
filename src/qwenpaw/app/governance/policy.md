@@ -204,7 +204,7 @@ evaluate() 根据这个信息去匹配 policy.yaml 中的规则。
 
 ## 四、policy.yaml 结构
 
-Policy 用**一个文件**，分三个 section：
+Policy 用**一个文件**，分两个 section：
 
 ```
 ~/.qwenpaw/policies/<workspace>/
@@ -212,7 +212,7 @@ Policy 用**一个文件**，分三个 section：
 ```
 
 ```yaml
-version: "2.0"
+version: "1.0"
 
 # ═══════════════════════════════════════════════════
 # Section 1: builtin_rules（系统内置，agent 不可修改）
@@ -304,14 +304,13 @@ user_rules:
 | Section | 谁能写 | 说明 |
 |---------|--------|------|
 | `builtin_rules` | 系统初始化 | agent 的 add_rule / remove_rule 不可碰 |
-| `defaults` | 系统初始化 | 同上 |
 | `user_rules` | 用户 / approve 流程 | agent approve 后的规则追加到这里 |
 
-代码层面：`Policy.add_rule()` 只往 `user_rules` 追加，`builtin_rules` 和 `defaults` 是只读的。
+代码层面：`Policy.add_rule()` 只往 `user_rules` 追加，`builtin_rules` 是只读的。
 
 ### 4.2 冷启动初始化
 
-当 `policy.yaml` 不存在或没有 `builtin_rules` section 时，系统自动写入默认的 builtin_rules：
+当 `policy.yaml` 不存在或没有 `builtin_rules` / `user_rules` section 时，系统自动写入默认规则：
 
 ```
 启动时：
@@ -319,16 +318,80 @@ user_rules:
   
   if not policy.builtin_rules:
       policy.builtin_rules = DEFAULT_BUILTIN_RULES  # 系统预置的保护规则
-      save(policy)
+  
+  if not policy.user_rules:
+      policy.user_rules = DEFAULT_USER_RULES        # 系统预置的默认权限
+  
+  save(policy)
 ```
 
 **DEFAULT_BUILTIN_RULES** 包含：
 - 敏感文件保护（`.env`、`.ssh`、`.pem`、`.key`）→ ask
 - 高危命令保护（`rm -rf /`、`sudo`、`chmod 777`）→ deny
 
-这样即使 `policy.yaml` 被用户删除或损坏，安全底线仍然生效。
+**DEFAULT_USER_RULES** 包含：
+- Internal 类 tool → allow（无副作用的内部操作）
+- File 类 tool（workspace 内）→ allow（读写项目文件）
+- Browser → allow（浏览器访问）
 
-## 四、评估流程
+这样即使 `policy.yaml` 被用户删除或损坏，安全底线和基本可用性仍然生效。
+
+### 4.3 默认 user_rules
+
+当 `user_rules` 为空时，系统初始化以下默认规则：
+
+```yaml
+# ── Internal 类 tool（无副作用，永远可以执行）──
+- match: "GetCurrentTime(*)"
+  action: allow
+- match: "GetTokenUsage(*)"
+  action: allow
+- match: "ListAgents(*)"
+  action: allow
+- match: "ChatWithAgent(*)"
+  action: allow
+- match: "SubmitToAgent(*)"
+  action: allow
+- match: "CheckAgentTask(*)"
+  action: allow
+- match: "DelegateExternalAgent(*)"
+  action: allow
+
+# ── File 类 tool（WORKSPACE_DIR 内文件操作，永远可以执行）──
+- match: "Read(WORKSPACE_DIR/*)"
+  action: allow
+- match: "Write(WORKSPACE_DIR/*)"
+  action: allow
+- match: "Edit(WORKSPACE_DIR/*)"
+  action: allow
+- match: "Append(WORKSPACE_DIR/*)"
+  action: allow
+- match: "Grep(WORKSPACE_DIR/*)"
+  action: allow
+- match: "Glob(WORKSPACE_DIR/*)"
+  action: allow
+
+# ── Browser（暂且当做永远可以执行）──
+- match: "Browser(*)"
+  action: allow
+```
+
+**设计原则**：
+- **Internal tool 永远可执行** — 获取时间、查询用量、列出 agent 等操作无副作用，不需要用户确认
+- **File tool 限定 WORKSPACE_DIR** — 读写项目文件是 agent 的核心能力，但仅限 workspace 目录内；workspace 外的文件（如 `/etc/passwd`、`~/.bashrc`）仍走 builtin_rules 或 fallback
+- **Browser 暂且永远可执行** — 后续可改为 ask 或更细粒度的域名白名单
+
+**`WORKSPACE_DIR` 占位符**：
+- 规则中 `WORKSPACE_DIR/*` 是占位符，在 `evaluate()` 时替换为实际的 workspace 路径
+- 例：workspace 为 `/home/user/project` 时，`Read(WORKSPACE_DIR/*)` 匹配 `Read("/home/user/project/src/main.py")`
+- 这样 File tool 默认规则只允许 workspace 内的文件操作，workspace 外的文件需要 builtin_rules 放行或走 fallback
+
+**与 builtin_rules 的关系**：
+- builtin_rules 优先评估，保护敏感资源（`.env`、`.ssh` 等）
+- default user_rules 提供基本可用性，不会覆盖 builtin_rules 的保护
+- 例：`Read(".env.production")` → builtin ask（builtin 先命中），不会被 default user_rules 的 `Read(WORKSPACE_DIR/*)` 覆盖（`.env.production` 虽在 workspace 内，但 builtin 优先级更高）
+
+## 五、评估流程
 
 ```
 Tool Call 进来
@@ -341,23 +404,27 @@ Tool Call 进来
           │ 未命中
           ▼
 ┌──────────────────────────┐
-│  ② user_rules             │  用户自定义规则
+│  ② user_rules             │  用户自定义规则（含默认规则）
 │  first-match-wins          │
 └─────────┬────────────────┘
           │ 未命中
           ▼
 ┌──────────────────────────┐
-│  ③ defaults               │  类型默认权限
-│  file.default.read → ALLOW │
-└─────────┬────────────────┘
-          │
-          ▼
-     PolicyDecision
+│  ③ 全局 fallback           │
+│  bash 类 tool → SANDBOX    │
+│  其他 → ASK                │
+└──────────────────────────┘
 ```
 
 **优先级**：builtin_rules > user_rules > 全局 fallback
 
-### 4.1 详细流程示例
+**默认 user_rules 的作用**：
+- Internal 类 tool → user_rules 命中 `GetCurrentTime(*)` 等 → ALLOW
+- File 类 tool → user_rules 命中 `Read(*)` / `Write(*)` 等 → ALLOW
+- Browser → user_rules 命中 `Browser(*)` → ALLOW
+- Bash → user_rules 无命中 → 全局 fallback → SANDBOX
+
+### 5.1 详细流程示例
 
 **示例 A：user_rules deny**  
 `Write("memory/secret.md")`
@@ -368,33 +435,26 @@ Tool Call 进来
 → PolicyDecision: DENY
 ```
 
-**示例 B：defaults fallback**  
-`Read("src/main.py")`
+**示例 B：default user_rules（File 类默认权限）**  
+`Read("src/main.py")`（workspace 内）
 
 ```
 ① builtin_rules → 无命中
-② user_rules   → 无命中
-③ defaults     → file.read = allow
+② user_rules   → 命中 "Read(WORKSPACE_DIR/*)" → allow（默认规则）
 → PolicyDecision: ALLOW
 ```
 
-**示例 C：builtin ask（资源保护）**  
-`Read(".env.production")`
+**示例 C：builtin ask（资源保护，防绕过）**  
+`Read(".env.production")` 或 `Bash("cat .env")`
 
 ```
 ① builtin_rules → 命中 "*(.env*)" → ask
 → PolicyDecision: ASK（用户确认后放行，但不记规则，下次还问）
 ```
 
-**示例 D：builtin ask 防绕过**  
-`Bash("cat .env")`
+> `*` 匹配所有 tool（Read、Write、Bash 等），不会被换 tool 绕过。
 
-```
-① builtin_rules → 命中 "*(.env*)" → ask（* 匹配所有 tool，包括 Bash）
-→ PolicyDecision: ASK（不会被绕过）
-```
-
-**示例 E：builtin deny（硬墙）**  
+**示例 D：builtin deny（硬墙）**  
 `Bash("sudo rm -rf /")`
 
 ```
@@ -402,7 +462,7 @@ Tool Call 进来
 → PolicyDecision: DENY（硬墙，不可放行）
 ```
 
-**示例 F：user_rules ask（可记录）**  
+**示例 E：user_rules ask（可记录）**  
 `Bash("git push origin main")`
 
 ```
@@ -411,57 +471,14 @@ Tool Call 进来
 → PolicyDecision: ASK（用户确认后，记录 allow 规则，下次不问）
 ```
 
-**示例 G：Bash sandbox fallback**  
+**示例 F：Bash sandbox fallback**  
 `Bash("npm install")`
 
 ```
 ① builtin_rules → 无命中
 ② user_rules   → 无命中
-③ defaults     → Bash 无 default 规则
-→ PolicyDecision: SANDBOX_FALLBACK（进入 sandbox 执行）
+③ 全局 fallback → bash 类 tool → SANDBOX_FALLBACK（进入 sandbox 执行）
 ```
-
-**示例 H：Network deny**  
-`Browser("https://evil.com")`
-
-```
-① builtin_rules → 无命中
-② user_rules   → 无命中
-③ defaults     → network.access = deny
-→ PolicyDecision: DENY
-```
-
-## 五、操作类型
-
-评估 default 时需要知道 tool 代表什么操作：
-
-| Tool | 操作类型 | 类型 | 说明 |
-|------|---------|------|------|
-| Read | read | File | 读取文件 |
-| Write | write | File | 写入文件 |
-| Edit | write | File | 编辑文件 |
-| Append | write | File | 追加写入 |
-| Grep | read | File | 内容搜索 |
-| Glob | read | File | 文件名匹配 |
-| SendFileToUser | read | File | 发送文件（读取） |
-| ViewImage | read | File | 查看图片（读取） |
-| ViewVideo | read | File | 查看视频（读取） |
-| MaterializeSkill | write | File | 技能物化（写入） |
-| DesktopScreenshot | write | File | 截图（写入文件） |
-| SetUserTimezone | write | File | 写 config 文件 |
-| Browser | access | Network | 浏览器访问 |
-| Bash | — | Shell | sandbox 兜底 |
-| GetCurrentTime | — | Internal | 直接 allow，不评估 |
-| GetTokenUsage | — | Internal | 直接 allow，不评估 |
-| ListAgents | — | Internal | 直接 allow，不评估 |
-| ChatWithAgent | — | Internal | 直接 allow，不评估 |
-| SubmitToAgent | — | Internal | 直接 allow，不评估 |
-| CheckAgentTask | — | Internal | 直接 allow，不评估 |
-| DelegateExternalAgent | — | Internal | config 层开关，直接 allow |
-
-> 操作类型只在查 default 时使用。rules 匹配不需要操作类型 —
-> `match: "Write(memory/**)"` 里 tool 名已经在 match pattern 里了。
-> Internal 类型不参与 default 评估，直接 allow。
 
 ## 六、Bash 的处理
 
@@ -471,7 +488,7 @@ Bash 不区分 File / Network 类型，统一走 sandbox：
 Bash tool call 进来
     │
     ▼
-  查 network.rules / file.rules 中有没有 Bash 的显式规则
+  查 builtin_rules / user_rules 中有没有 Bash 的显式规则
     │
     ├─ 命中 → 按规则处理（allow / deny / ask）
     │
@@ -481,28 +498,25 @@ Bash tool call 进来
 ```
 
 ```yaml
-# 如果需要对 Bash 做显式控制，可以写在任一类型的 rules 中：
-file:
-  rules:
-    - match: "Bash(rm -rf *)"
-      action: deny
+# 如果需要对 Bash 做显式控制，可以写在 builtin_rules 或 user_rules 中：
+builtin_rules:
+  - match: "Bash(rm -rf *)"
+    action: deny
 
-network:
-  rules:
-    - match: "Bash(curl *)"
-      action: sandbox
-    - match: "Bash(git push *)"
-      action: ask
+user_rules:
+  - match: "Bash(curl *)"
+    action: deny
+  - match: "Bash(git push *)"
+    action: ask
 ```
 
 ## 七、与现有实现的差异
 
 | | 现状 (v1) | 新设计 (v2) |
 |---|---|---|
-| 规则结构 | 单一 `rules` 列表 | 按类型分组：`file.rules` + `network.rules` |
-| 默认行为 | 硬编码在 `evaluate()` 里 | 声明式 `default` 配置 |
-| fallback | 全局 `SANDBOX_FALLBACK` / `ASK` | 类型级 `default` + Bash 统一 sandbox |
-| 操作类型 | 无概念 | read / write / access 用于查 default |
+| 规则结构 | 单一 `rules` 列表 | `builtin_rules` + `user_rules` 两层 |
+| 默认行为 | 硬编码在 `evaluate()` 里 | builtin_rules 显式声明 + 全局 fallback |
+| fallback | 全局 `SANDBOX_FALLBACK` / `ASK` | workspace 读写 ALLOW + Bash SANDBOX + 其他 ASK |
 | memory/cache | 无特殊处理 | File 类型内的路径子集 |
 
 ## 八、从真实 policy.yaml 发现的问题
@@ -542,16 +556,17 @@ rules:
 - `echo world` → 又问一次 → 又加一条规则 → policy.yaml 越来越长
 - session 结束后全丢，下次重头来
 
-**修复**：approve 时做**规则泛化**，而不是记精确匹配。策略：
+**当前策略**：暂不做泛化，approve 时记录精确匹配，避免通配符带来的安全风险。
+后续可根据实际使用反馈，按需开启泛化。
 
-| 场景 | 当前行为 | 期望行为 |
-|------|---------|---------|
-| approve `echo hello` | 记 `Bash(echo hello)` | 记 `Bash(echo *)` |
-| approve `ls -lh` | 记 `Bash(ls -lh)` | 记 `Bash(ls *)` |
-| approve `curl https://api.example.com` | 记精确 URL | 记 `Bash(curl https://api.example.com/*)` 或提示用户选范围 |
+| 场景 | 当前行为 |
+|------|---------|
+| approve `echo hello` | 记 `Bash(echo hello)` |
+| approve `ls -lh` | 记 `Bash(ls -lh)` |
+| approve `curl https://api.example.com` | 记 `Bash(curl https://api.example.com)` |
 
-泛化算法：取 target 的第一个 token 作为前缀，后面加 `*`。
-对于高风险操作（rm、curl、git push）不泛化，保持精确。
+泛化算法预留：取 target 的第一个 token 作为前缀，后面加 `*`。
+高风险操作（rm、curl、git push）不泛化，保持精确。后续按需启用。
 
 ### 8.3 没有 deny 规则
 
@@ -561,16 +576,13 @@ rules:
 **修复**：policy.yaml 出厂时预置 deny 规则（built-in deny list）：
 
 ```yaml
-file:
-  rules:
-    - match: "Write(.env*)"
-      action: deny
-    - match: "Read(.env*)"
-      action: deny
-    - match: "Bash(rm -rf *)"
-      action: deny
-    - match: "Bash(sudo *)"
-      action: deny
+builtin_rules:
+  - match: "*(.env*)"
+    action: ask
+  - match: "Bash(rm -rf *)"
+    action: deny
+  - match: "Bash(sudo *)"
+    action: deny
 ```
 
 这些规则用户不能删除（或需要显式确认才能覆盖）。
@@ -592,15 +604,14 @@ file:
 | 问题 | v1 行为 | v2 改进 |
 |------|--------|--------|
 | 空 pattern | 写入空规则，全放行 | 禁止空 pattern 规则 |
-| 精确匹配 | 记原始 target | 泛化为 pattern |
+| 精确匹配 | 记原始 target | 暂记精确匹配，泛化预留 |
 | 无 deny 规则 | 无预置保护 | 内置 deny list |
 | 全 session | session 结束全丢 | 支持 permanent + 智能默认 |
 
 ## 九、待讨论
 
 1. **Network 的 sandbox_defaults 粒度** — 只到端口够吗？需要域名白名单/黑名单吗？
-2. **session 级规则的归属** — 用户 approve 后自动添加的规则放在 `file.rules` 还是 `network.rules`？按 tool 类型自动分？
-3. **default 是否需要支持 grantee** — 比如 `file.default.write = allow` 但只对特定 agent？
-4. **compile_sandbox_config** — 现在需要同时编译文件权限和网络权限，接口需要调整
-5. **规则泛化的边界** — 哪些操作可以泛化、哪些必须精确？需要一张高风险操作清单
-6. **内置 deny list 的可覆盖性** — 用户能否 override 内置 deny？如果能，需要几级确认？
+2. **session 级规则的归属** — 用户 approve 后自动添加的规则放在 `user_rules` 中，按 tool 名区分即可
+3. **compile_sandbox_config** — 现在需要同时编译文件权限和网络权限，接口需要调整
+4. **规则泛化的边界** — 哪些操作可以泛化、哪些必须精确？需要一张高风险操作清单
+5. **内置 deny list 的可覆盖性** — 用户能否 override 内置 deny？如果能，需要几级确认？
