@@ -668,7 +668,7 @@ class TestACLApplication:
 
         from qwenpaw.sandbox.windows_elevated_sandbox import _apply_all_acls
 
-        entries = _apply_all_acls(config, "S-1-5-21-cap", "S-1-5-21-user")
+        entries = _apply_all_acls(config, "S-1-5-21-cap")
 
         # Shared-user ACEs are persistent and managed outside this helper.
         ws_entries = [e for e in entries if e.path == r"C:\project"]
@@ -734,7 +734,7 @@ class TestACLApplication:
 
         from qwenpaw.sandbox.windows_elevated_sandbox import _apply_all_acls
 
-        entries = _apply_all_acls(config, "S-1-5-21-cap", "S-1-5-21-user")
+        entries = _apply_all_acls(config, "S-1-5-21-cap")
 
         mount_entries = [e for e in entries if e.path == r"C:\readonly"]
         assert any(
@@ -800,7 +800,7 @@ class TestACLApplication:
 
         from qwenpaw.sandbox.windows_elevated_sandbox import _apply_all_acls
 
-        entries = _apply_all_acls(config, "S-1-5-21-cap", "S-1-5-21-user")
+        entries = _apply_all_acls(config, "S-1-5-21-cap")
 
         deny_entries = [e for e in entries if e.access_mode == "deny_all"]
         assert deny_entries == []
@@ -862,7 +862,7 @@ class TestACLApplication:
 
         from qwenpaw.sandbox.windows_elevated_sandbox import _apply_all_acls
 
-        entries = _apply_all_acls(config, "S-1-5-21-cap", "S-1-5-21-user")
+        entries = _apply_all_acls(config, "S-1-5-21-cap")
 
         mount_entries = [e for e in entries if e.path == r"C:\shared"]
         assert any(

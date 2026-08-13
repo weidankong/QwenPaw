@@ -59,7 +59,6 @@ from .windows_sandbox_base import (
     _set_path_ace,
     _sid_to_string,
     _string_to_sid,
-    _verify_acl_present_sync,
     _wait_and_read_process,
 )
 from .windows_sandbox_base import (
@@ -636,7 +635,7 @@ def _resolve_user_sid(username: str) -> str:
     return _sid_to_string(ctypes.cast(sid_buf, ctypes.c_void_p))
 
 
-def _ensure_dedicated_user(
+def _ensure_dedicated_user(  # pylint: disable=R0912,R0915
     state: Dict[str, Any],
     username: str,
     *,
@@ -1213,7 +1212,7 @@ def _add_traverse_ace(
         kernel32.CloseHandle(h_dir)
 
 
-def _remove_traverse_ace(
+def _remove_traverse_ace(  # pylint: disable=R0912
     path: str,
     sid_string: str,
 ) -> bool:
@@ -1649,7 +1648,6 @@ def _ensure_workspace_traverse_acls(
 def _apply_all_acls(
     config: SandboxConfig,
     cap_sid_string: str,
-    user_sid_string: str,
 ) -> List[_AclEntry]:
     """Applies filesystem ACLs for the elevated sandbox.
 
@@ -1661,7 +1659,6 @@ def _apply_all_acls(
     Args:
         config: Sandbox configuration.
         cap_sid_string: Capability SID string for the restricting list.
-        user_sid_string: Sandbox user's SID string.
 
     Returns:
         List of applied ACL entries.
@@ -2209,7 +2206,7 @@ def _create_new_sandbox(
         bool(config.network_allow) and "*" in config.network_allow
     )
     cap_sid = _make_random_cap_sid_string()
-    acl_entries = _apply_all_acls(config, cap_sid, user_sid_string)
+    acl_entries = _apply_all_acls(config, cap_sid)
 
     kernel32 = _get_kernel32()
     if os.path.exists(profile_dir):
@@ -2423,7 +2420,7 @@ class WindowsElevatedSandbox(WindowsSandboxBase):
                 duration_ms=duration_ms,
             )
 
-    async def stop(self) -> None:
+    async def stop(self) -> None:  # pylint: disable=R0912
         """Terminates any running child process tree.
 
         Uses ``TerminateJobObject`` when a Job Object is available to kill

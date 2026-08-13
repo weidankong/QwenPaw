@@ -324,7 +324,7 @@ class TestBaseEnvironment:
 
     @patch.dict("os.environ", {}, clear=True)
     @patch(
-        "qwenpaw.sandbox.windows_unelevated_sandbox._get_python_install_dir",
+        "qwenpaw.sandbox.windows_sandbox_base._get_python_install_dir",
         return_value=r"C:\QwenPaw\binaries\qwenpaw-backend",
     )
     def test_does_not_inject_pythonhome(self, mock_python_dir):

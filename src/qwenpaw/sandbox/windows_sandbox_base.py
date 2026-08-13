@@ -3,7 +3,8 @@
 
 Provides the shared foundation for all Windows sandbox backends:
 - Win32 constants (_WC)
-- ctypes structures (SID_AND_ATTRIBUTES, STARTUPINFOW, PROCESS_INFORMATION, etc.)
+- ctypes structures (SID_AND_ATTRIBUTES, STARTUPINFOW,
+  PROCESS_INFORMATION, etc.)
 - DLL accessors (kernel32, advapi32)
 - Pipe output decoding
 - SID / Token / ACL helpers
@@ -14,7 +15,6 @@ Provides the shared foundation for all Windows sandbox backends:
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import ctypes
 import ctypes.wintypes

@@ -19,7 +19,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .config import ExecutionResult, SandboxConfig
 from .windows_sandbox_base import (
@@ -38,9 +38,6 @@ from .windows_sandbox_base import (
     _get_advapi32,
     _get_kernel32,
     _get_logon_sid_bytes,
-    _get_python_install_dir,
-    _is_admin,
-    _is_pid_alive,
     _iter_orphaned_metadata,
     _make_env_block,
     _make_random_cap_sid_string,
@@ -51,7 +48,6 @@ from .windows_sandbox_base import (
     _save_sandbox_metadata,
     _set_default_dacl,
     _set_path_ace,
-    _sid_to_string,
     _string_to_sid,
     _verify_acl_present_sync,
     _wait_and_read_process,
