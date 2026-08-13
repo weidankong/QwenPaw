@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """Windows elevated sandbox implementation.
 
-Uses a dedicated local user account with a WRITE_RESTRICTED token and WFP
-firewall rules for process isolation.  Read/execute access uses normal DACL
-evaluation; only write operations check the restricting SID list.
+Uses two persistent local user accounts (network-enabled and network-blocked)
+with an unelevated-style WRITE_RESTRICTED token.  Read/execute access uses
+normal DACL evaluation; only write operations check the per-sandbox
+capability SID in the restricting SID list.  Persistent deny ACEs on the two
+dedicated users protect configured sensitive paths.
 
 Selected when ``allow_read_all=True`` and the process has administrator
 privileges.  Requires Windows 10 1507+.
@@ -38,8 +40,9 @@ from .windows_unelevated_sandbox import (
     _compute_config_fingerprint,
     _copy_sid_from_ptr,
     _create_job_object,
-    _create_stdio_pipes,
     _create_well_known_sid,
+    _create_restricted_token as _create_unelevated_restricted_token,
+    _create_stdio_pipes,
     _enable_privilege,
     _get_logon_sid_bytes,
     _get_python_install_dir,
@@ -72,9 +75,13 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════
 
 SANDBOX_USERS_GROUP = "QwenpawUsers"
+SANDBOX_NETWORK_USER = "qwenpaw_net"
+SANDBOX_NO_NETWORK_USER = "qwenpaw_nonet"
+
+_DEDICATED_USERS_STATE_ID = "elevated_users"
+_DEDICATED_USERS_STATE_VERSION = 1
 
 _LUA_TOKEN = 0x04
-
 _TokenUser = 1
 
 # CreateProcessWithTokenW logon flags
@@ -89,6 +96,7 @@ _USER_PRIV_USER = 1
 _UF_SCRIPT = 0x0001
 _UF_DONT_EXPIRE_PASSWD = 0x10000
 _NERR_Success = 0
+_NERR_UserExists = 2224
 _ERROR_ALIAS_EXISTS = 1379
 
 
@@ -350,7 +358,7 @@ def _local_free(ptr: int) -> None:
 
 
 def _dpapi_encrypt(plaintext: str) -> str:
-    """Encrypts a string using DPAPI (current user scope).
+    """Encrypts a string using DPAPI (local machine scope).
 
     Args:
         plaintext: String to encrypt.
@@ -377,7 +385,7 @@ def _dpapi_encrypt(plaintext: str) -> str:
         None,
         None,
         None,
-        0,
+        0x00000004,  # CRYPTPROTECT_LOCAL_MACHINE
         ctypes.byref(blob_out),
     ):
         raise OSError(
@@ -450,12 +458,6 @@ class _USER_INFO_1(ctypes.Structure):
     ]
 
 
-class _USER_INFO_1003(ctypes.Structure):
-    _fields_ = [
-        ("usri1003_password", ctypes.c_wchar_p),
-    ]
-
-
 class _LOCALGROUP_INFO_1(ctypes.Structure):
     _fields_ = [
         ("lgrpi1_name", ctypes.c_wchar_p),
@@ -486,6 +488,7 @@ def _ensure_local_group(name: str, comment: str) -> bool:
 
 
 def _ensure_local_user(username: str, password: str) -> bool:
+    """Creates a local user without changing an existing password."""
     netapi32 = _get_netapi32()
     info = _USER_INFO_1(
         usri1_name=username,
@@ -498,26 +501,10 @@ def _ensure_local_user(username: str, password: str) -> bool:
         usri1_script_path=None,
     )
     status = netapi32.NetUserAdd(None, 1, ctypes.byref(info), None)
-    if status == _NERR_Success:
+    if status in (_NERR_Success, _NERR_UserExists):
         return True
-
-    pw_info = _USER_INFO_1003(usri1003_password=password)
-    upd = netapi32.NetUserSetInfo(
-        None,
-        ctypes.c_wchar_p(username),
-        1003,
-        ctypes.byref(pw_info),
-        None,
-    )
-    if upd != _NERR_Success:
-        logger.warning(
-            "Failed to create/update user %s: create=%d, update=%d",
-            username,
-            status,
-            upd,
-        )
-        return False
-    return True
+    logger.warning("Failed to create user %s: code=%d", username, status)
+    return False
 
 
 def _ensure_group_member(group_name: str, username: str) -> None:
@@ -613,6 +600,224 @@ def _provision_sandbox_user(username: str, password: str) -> bool:
     return True
 
 
+def _dedicated_users_state_path() -> Path:
+    return _qwenpaw_state_dir / f"{_DEDICATED_USERS_STATE_ID}.json"
+
+
+def _load_dedicated_users_state() -> Dict[str, Any]:
+    path = _dedicated_users_state_path()
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    if state.get("version") != _DEDICATED_USERS_STATE_VERSION:
+        state = {
+            "version": _DEDICATED_USERS_STATE_VERSION,
+            "users": {},
+            "deny_paths": [],
+        }
+    state.setdefault("users", {})
+    state.setdefault("deny_paths", [])
+    return state
+
+
+def _save_dedicated_users_state(state: Dict[str, Any]) -> Path:
+    return _save_sandbox_metadata(
+        _qwenpaw_state_dir,
+        _DEDICATED_USERS_STATE_ID,
+        state,
+    )
+
+
+def _resolve_user_sid(username: str) -> str:
+    result = _lookup_account_sid(username)
+    if result is None:
+        raise OSError(f"Dedicated sandbox user not found: {username}")
+    sid_buf, _ = result
+    return _sid_to_string(ctypes.cast(sid_buf, ctypes.c_void_p))
+
+
+def _ensure_dedicated_user(
+    state: Dict[str, Any],
+    username: str,
+    *,
+    network_blocked: bool,
+) -> Tuple[str, str, str]:
+    """Ensures one persistent sandbox account and returns its credentials.
+
+    Existing account passwords are deliberately never changed.  If the
+    credential state is missing or unreadable while the account still exists,
+    recovery requires an explicit administrator action instead of silently
+    rotating the password on every sandbox startup.
+    """
+    users = state["users"]
+    record = users.get(username)
+    password: Optional[str] = None
+    if record:
+        encrypted_password = record.get("encrypted_password", "")
+        if encrypted_password:
+            try:
+                password = _dpapi_decrypt(encrypted_password)
+            except (OSError, ValueError):
+                password = None
+
+    account_exists = _lookup_account_sid(username) is not None
+    if account_exists and not password:
+        raise OSError(
+            f"Dedicated sandbox user '{username}' exists but its managed "
+            "credential is unavailable. Remove that account and "
+            f"'{_dedicated_users_state_path()}' once, then retry.",
+        )
+
+    if not password:
+        password = _random_password()
+        try:
+            encrypted_password = _dpapi_encrypt(password)
+        except OSError as exc:
+            raise OSError(
+                "Failed to protect dedicated sandbox credentials with DPAPI",
+            ) from exc
+        record = {
+            "encrypted_password": encrypted_password,
+            "network_blocked": network_blocked,
+        }
+        users[username] = record
+        # Persist the credential before account creation so an interrupted
+        # first-time setup can resume without rotating the password.
+        _save_dedicated_users_state(state)
+
+    if not account_exists:
+        if not _provision_sandbox_user(username, password):
+            raise OSError(f"Failed to provision sandbox user: {username}")
+        record["provisioned"] = True
+    elif not record.get("provisioned"):
+        # Resume a first-time setup interrupted after account creation.
+        _ensure_local_group(
+            SANDBOX_USERS_GROUP,
+            "QwenPaw sandbox internal group (managed)",
+        )
+        _ensure_group_member(SANDBOX_USERS_GROUP, username)
+        _grant_batch_logon_right(username)
+        record["provisioned"] = True
+
+    try:
+        h_token = _logon_user(username, password)
+    except OSError:
+        # Repair a lost batch-logon right once, without rotating the password.
+        try:
+            _grant_batch_logon_right(username)
+            h_token = _logon_user(username, password)
+        except OSError as retry_exc:
+            raise OSError(
+                f"Dedicated sandbox user '{username}' cannot log on; its "
+                "password was not changed. Remove the managed account and "
+                "state file once to reprovision it.",
+            ) from retry_exc
+
+    try:
+        user_sid = _resolve_user_sid(username)
+        stored_profile = record.get("profile_dir")
+        if stored_profile and os.path.isdir(stored_profile):
+            profile_dir = stored_profile
+        else:
+            _create_user_profile(user_sid, username)
+            profile_dir = _resolve_profile_dir(h_token, username)
+    finally:
+        _get_kernel32().CloseHandle(h_token)
+
+    for sub in (
+        os.path.join("AppData", "Local", "Temp"),
+        os.path.join("AppData", "Roaming"),
+    ):
+        os.makedirs(os.path.join(profile_dir, sub), exist_ok=True)
+
+    record["user_sid"] = user_sid
+    record["profile_dir"] = profile_dir
+    if network_blocked and not record.get("firewall_installed"):
+        if not _install_wfp_block_filters(username, user_sid):
+            raise OSError(
+                "Failed to install network block for sandbox user: "
+                f"{username}",
+            )
+        record["firewall_installed"] = True
+
+    return password, user_sid, profile_dir
+
+
+def _ensure_dedicated_users(
+    config: SandboxConfig,
+) -> Tuple[str, str, str, str]:
+    """Ensures both shared users and returns the selected user's context."""
+    with _sandbox_file_lock(_DEDICATED_USERS_STATE_ID):
+        state = _load_dedicated_users_state()
+        contexts: Dict[str, Tuple[str, str, str]] = {}
+        contexts[SANDBOX_NETWORK_USER] = _ensure_dedicated_user(
+            state,
+            SANDBOX_NETWORK_USER,
+            network_blocked=False,
+        )
+        contexts[SANDBOX_NO_NETWORK_USER] = _ensure_dedicated_user(
+            state,
+            SANDBOX_NO_NETWORK_USER,
+            network_blocked=True,
+        )
+
+        kernel32 = _get_kernel32()
+        deny_paths = set(state.get("deny_paths", []))
+        for configured_path in config.deny_paths:
+            expanded = os.path.normpath(os.path.expanduser(configured_path))
+            normalized = os.path.normcase(expanded)
+            if normalized in deny_paths or not os.path.exists(expanded):
+                continue
+            applied = True
+            for _, user_sid, _ in contexts.values():
+                user_psid = _string_to_sid(user_sid)
+                try:
+                    applied = (
+                        _add_deny_all_ace(expanded, user_psid) and applied
+                    )
+                finally:
+                    kernel32.LocalFree(user_psid)
+            if applied:
+                deny_paths.add(normalized)
+
+        # Shared user access is persistent.  Only capability ACEs are tracked
+        # in per-instance metadata and removed when that instance exits.
+        for _, user_sid, _ in contexts.values():
+            user_psid = _string_to_sid(user_sid)
+            try:
+                _add_allow_ace(config.workspace_dir, user_psid)
+                for mount in config.mounts:
+                    if os.path.exists(mount.path):
+                        add_mount_ace = (
+                            _add_allow_ace
+                            if mount.writable
+                            else _add_allow_read_ace
+                        )
+                        add_mount_ace(
+                            mount.path,
+                            user_psid,
+                        )
+                _ensure_workspace_traverse_acls(
+                    config.workspace_dir,
+                    user_psid,
+                )
+            finally:
+                kernel32.LocalFree(user_psid)
+
+        state["deny_paths"] = sorted(deny_paths)
+        _save_dedicated_users_state(state)
+
+    network_blocked = not (
+        bool(config.network_allow) and "*" in config.network_allow
+    )
+    username = (
+        SANDBOX_NO_NETWORK_USER if network_blocked else SANDBOX_NETWORK_USER
+    )
+    password, user_sid, profile_dir = contexts[username]
+    return username, password, user_sid, profile_dir
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # LogonUser (authenticate as sandbox user)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -684,7 +889,7 @@ def _get_profile_directory(h_token: ctypes.wintypes.HANDLE) -> Optional[str]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _get_token_info_raw(
+def _get_token_info_raw_legacy(
     h_token: ctypes.wintypes.HANDLE,
     info_class: int,
     label: str,
@@ -716,8 +921,8 @@ def _get_token_info_raw(
     return buf
 
 
-def _get_user_sid_bytes(h_token: ctypes.wintypes.HANDLE) -> bytes:
-    buf = _get_token_info_raw(h_token, _TokenUser, "TokenUser")
+def _get_user_sid_bytes_legacy(h_token: ctypes.wintypes.HANDLE) -> bytes:
+    buf = _get_token_info_raw_legacy(h_token, _TokenUser, "TokenUser")
 
     ptr_size = ctypes.sizeof(ctypes.c_void_p)
     if ptr_size == 8:
@@ -731,7 +936,7 @@ def _get_user_sid_bytes(h_token: ctypes.wintypes.HANDLE) -> bytes:
     return sid_bytes
 
 
-def _create_restricted_token(
+def _create_restricted_token_legacy(
     h_base_token: ctypes.wintypes.HANDLE,
     cap_sid_strings: List[str],
 ) -> ctypes.wintypes.HANDLE:
@@ -755,7 +960,7 @@ def _create_restricted_token(
     kernel32 = _get_kernel32()
 
     logon_sid_bytes = _get_logon_sid_bytes(h_base_token)
-    user_sid_bytes = _get_user_sid_bytes(h_base_token)
+    user_sid_bytes = _get_user_sid_bytes_legacy(h_base_token)
 
     sid_buffers: List[Any] = []
     entries: List[_SID_AND_ATTRIBUTES] = []
@@ -822,6 +1027,24 @@ def _create_restricted_token(
 # ═══════════════════════════════════════════════════════════════════════════
 # ACL management via Win32 API (module-specific — calls _ensure_privileges)
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+def _create_restricted_token(
+    h_base_token: ctypes.wintypes.HANDLE,
+    cap_sid_strings: List[str],
+) -> ctypes.wintypes.HANDLE:
+    """Creates the capability-gated token used by the unelevated backend."""
+    if len(cap_sid_strings) != 1:
+        raise ValueError(
+            "Elevated sandbox requires exactly one capability SID",
+        )
+    kernel32 = _get_kernel32()
+    token, cap_psid = _create_unelevated_restricted_token(
+        h_base_token,
+        cap_sid_strings[0],
+    )
+    kernel32.LocalFree(cap_psid)
+    return token
 
 
 _privileges_enabled = False
@@ -1579,9 +1802,10 @@ def _apply_all_acls(
 ) -> List[_AclEntry]:
     """Applies filesystem ACLs for the elevated sandbox.
 
-    Grants write to workspace/mounts for both the capability SID and user
-    SID, denies deny_paths, ensures Python dir is readable, and grants
-    traverse on parent directories.
+    Grants the per-instance capability SID access to the workspace/mounts.
+    Shared-user access and deny ACEs are provisioned once by
+    :func:`_ensure_dedicated_users` and are deliberately not included in
+    per-instance cleanup metadata.
 
     Args:
         config: Sandbox configuration.
@@ -1620,29 +1844,6 @@ def _apply_all_acls(
         _grant_workspace_and_mounts(psid, "cap")
 
         _ensure_python_dir_group_acl()
-
-        user_psid = _string_to_sid(user_sid_string)
-        try:
-            _grant_workspace_and_mounts(user_psid, "user")
-
-            # Grant traverse on all parent directories from drive root
-            # to workspace_dir using the sandbox user's SID.
-            # Uses NtSetSecurityObject (<1ms per dir, no propagation).
-            # These are per-sandbox and cleaned up on exit.
-            traverse_entries = _ensure_workspace_traverse_acls(
-                config.workspace_dir,
-                user_psid,
-            )
-            entries.extend(traverse_entries)
-
-            for deny_path in config.deny_paths:
-                expanded = os.path.expanduser(deny_path)
-                if os.path.exists(expanded):
-                    _add_deny_all_ace(expanded, user_psid)
-                    entries.append(_AclEntry(expanded, "deny_all", "user"))
-        finally:
-            kernel32.LocalFree(user_psid)
-
         _allow_null_device(psid)
     finally:
         kernel32.LocalFree(psid)
@@ -2054,6 +2255,7 @@ class _SandboxInstance:
 
 def _find_reusable_sandbox(
     sandbox_name: str,
+    config: SandboxConfig,
 ) -> Optional[_SandboxInstance]:
     sb_dir = _sandboxes_dir(_qwenpaw_state_dir)
     meta_file = sb_dir / f"{sandbox_name}.json"
@@ -2063,7 +2265,7 @@ def _find_reusable_sandbox(
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
-    return _restore_from_metadata(meta, meta_file)
+    return _restore_from_metadata(meta, meta_file, config)
 
 
 def _resolve_profile_dir(
@@ -2083,58 +2285,19 @@ def _resolve_profile_dir(
 def _restore_from_metadata(
     meta: Dict[str, Any],
     meta_file: Path,
+    config: SandboxConfig,
 ) -> Optional[_SandboxInstance]:
     try:
-        username = meta["username"]
+        username, password, user_sid, profile_dir = _ensure_dedicated_users(
+            config,
+        )
+        if meta.get("username") != username:
+            _cleanup_from_metadata(meta, meta_file)
+            return None
+        h_user_token = _logon_user(username, password)
 
-        password = None
-        encrypted_password = meta.get("encrypted_password")
-        if encrypted_password:
-            try:
-                password = _dpapi_decrypt(encrypted_password)
-            except OSError:
-                logger.debug(
-                    "DPAPI decryption failed for %s; will reset password",
-                    username,
-                )
-
-        password_was_reset = False
-        if password:
-            try:
-                h_user_token = _logon_user(username, password)
-            except OSError:
-                password = None
-
-        if not password:
-            password = _random_password()
-            if not _ensure_local_user(username, password):
-                return None
-            try:
-                h_user_token = _logon_user(username, password)
-            except OSError as e:
-                # If logon still fails after password reset, grant batch
-                # logon right (may have been lost) and retry once.
-                logger.debug(
-                    "LogonUserW failed after password reset for %s: %s; "
-                    "re-granting SeBatchLogonRight and retrying",
-                    username,
-                    e,
-                )
-                try:
-                    _grant_batch_logon_right(username)
-                except OSError:
-                    pass
-                h_user_token = _logon_user(username, password)
-            password_was_reset = True
-
-        # Always update owner_pid so that shutdown_cleanup in other
-        # processes knows this sandbox is actively in use.  Also persist
-        # the new password when it was reset, so subsequent startups
-        # don't encounter stale credentials (error 1326).
         try:
             meta["owner_pid"] = os.getpid()
-            if password_was_reset:
-                meta["encrypted_password"] = _dpapi_encrypt(password)
             meta_file.write_text(
                 json.dumps(meta, indent=2),
                 encoding="utf-8",
@@ -2145,7 +2308,6 @@ def _restore_from_metadata(
                 username,
             )
 
-        user_sid = meta.get("user_sid", "")
         if user_sid:
             _grant_winsta_desktop_access(user_sid)
 
@@ -2158,16 +2320,10 @@ def _restore_from_metadata(
             for e in meta.get("acl_entries", [])
         ]
 
-        profile_dir = _resolve_profile_dir(
-            h_user_token,
-            meta["username"],
-            meta.get("profile_dir"),
-        )
-
         return _SandboxInstance(
             sandbox_id=meta["sandbox_id"],
             username=meta["username"],
-            user_sid_string=meta["user_sid"],
+            user_sid_string=user_sid,
             cap_sid=cap_sid,
             h_user_token=h_user_token,
             h_token=h_token,
@@ -2193,36 +2349,16 @@ def _create_new_sandbox(
         )
 
     sandbox_id = f"qwenpaw_{fingerprint[:12]}"
-    username = sandbox_id
-    password = _random_password()
-
-    if not _provision_sandbox_user(username, password):
-        raise OSError(f"Failed to provision sandbox user: {username}")
-
+    username, password, user_sid_string, profile_dir = _ensure_dedicated_users(
+        config,
+    )
     h_user_token = _logon_user(username, password)
-    user_sid_bytes = _get_user_sid_bytes(h_user_token)
-    user_sid_buf = (ctypes.c_ubyte * len(user_sid_bytes))(*user_sid_bytes)
-    user_sid_ptr = ctypes.cast(user_sid_buf, ctypes.c_void_p)
-    user_sid_string = _sid_to_string(user_sid_ptr)
-
-    _create_user_profile(user_sid_string, username)
-    profile_dir = _resolve_profile_dir(h_user_token, username)
-
-    for sub in (
-        os.path.join("AppData", "Local", "Temp"),
-        os.path.join("AppData", "Roaming"),
-    ):
-        p = os.path.join(profile_dir, sub)
-        os.makedirs(p, exist_ok=True)
 
     _grant_winsta_desktop_access(user_sid_string)
 
     network_blocked = not (
         bool(config.network_allow) and "*" in config.network_allow
     )
-    if network_blocked:
-        _install_wfp_block_filters(username, user_sid_string)
-
     cap_sid = _make_random_cap_sid_string()
     acl_entries = _apply_all_acls(config, cap_sid, user_sid_string)
 
@@ -2233,17 +2369,12 @@ def _create_new_sandbox(
         try:
             _add_allow_ace(profile_dir, cap_psid)
             _add_allow_ace(profile_dir, user_psid)
+            acl_entries.append(_AclEntry(profile_dir, "allow_full", "cap"))
         finally:
             kernel32.LocalFree(cap_psid)
             kernel32.LocalFree(user_psid)
 
     h_token = _create_restricted_token(h_user_token, [cap_sid])
-
-    encrypted_password = None
-    try:
-        encrypted_password = _dpapi_encrypt(password)
-    except OSError:
-        logger.debug("DPAPI encryption unavailable; password not persisted")
 
     meta = {
         "sandbox_id": sandbox_id,
@@ -2254,7 +2385,6 @@ def _create_new_sandbox(
         "network_blocked": network_blocked,
         "profile_dir": profile_dir,
         "owner_pid": os.getpid(),
-        "encrypted_password": encrypted_password,
         "acl_entries": [
             {
                 "path": e.path,
@@ -2303,7 +2433,7 @@ def _acquire_sandbox_sync(config: SandboxConfig) -> _SandboxInstance:
     sandbox_name = f"qwenpaw_{fingerprint[:12]}"
 
     with _sandbox_file_lock(sandbox_name):
-        existing = _find_reusable_sandbox(sandbox_name)
+        existing = _find_reusable_sandbox(sandbox_name, config)
         if existing is not None:
             logger.debug("Reusing sandbox %s from disk", existing.sandbox_id)
             return existing
@@ -2384,7 +2514,7 @@ class WindowsElevatedSandbox(WindowsSandboxBase):
         env["TEMP"] = f"{sandbox_profile}\\AppData\\Local\\Temp"
         env["TMP"] = f"{sandbox_profile}\\AppData\\Local\\Temp"
         env["HOMEDRIVE"] = sys_drive
-        env["HOMEPATH"] = sandbox_profile[len(sys_drive) :]
+        env["HOMEPATH"] = sandbox_profile[len(sys_drive):]
 
         try:
             (
@@ -2764,6 +2894,11 @@ def _remove_acls_from_metadata(
         if sid_type == "cap":
             sid = cap_sid
         elif sid_type == "user":
+            if _username in {SANDBOX_NETWORK_USER, SANDBOX_NO_NETWORK_USER}:
+                # Shared-user ACEs are persistent and may be used by other
+                # concurrent sandboxes; never remove them during instance
+                # cleanup.
+                continue
             sid = user_sid
         elif sid_type == "group":
             # Traverse ACEs for QwenpawUsers group are persistent
@@ -2860,40 +2995,18 @@ def _cleanup_from_metadata(  # pylint: disable=R0912
     )
 
     firewall_ok = True
-    if network_blocked and username:
+    persistent_user = username in {
+        SANDBOX_NETWORK_USER,
+        SANDBOX_NO_NETWORK_USER,
+    }
+    if network_blocked and username and not persistent_user:
         firewall_ok = _remove_firewall_rules_sync(username)
-        t2 = time.monotonic()
-        logger.info(
-            "[%s] Firewall rules removal: %.2fs",
-            sandbox_id,
-            t2 - t1,
-        )
-    else:
-        t2 = t1
 
     user_ok = True
-    if username:
-        user_ok = _delete_local_user_sync(username)
-        t3 = time.monotonic()
-        logger.info(
-            "[%s] User account deletion: %.2fs",
-            sandbox_id,
-            t3 - t2,
-        )
-    else:
-        t3 = t2
-
     profile_ok = True
-    if username:
+    if username and not persistent_user:
+        user_ok = _delete_local_user_sync(username)
         profile_ok = _remove_profile_dir_sync(username, user_sid)
-        t4 = time.monotonic()
-        logger.info(
-            "[%s] Profile directory removal: %.2fs",
-            sandbox_id,
-            t4 - t3,
-        )
-    else:
-        t4 = t3
 
     # Determine if any step failed
     failures: List[str] = []

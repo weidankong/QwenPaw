@@ -401,11 +401,10 @@ class TestUserProvisioning:
         mock_netapi32.NetUserAdd.assert_called_once()
 
     @patch("qwenpaw.sandbox.windows_elevated_sandbox._get_netapi32")
-    def test_ensure_local_user_updates_existing(self, mock_netapi32_fn):
-        """Existing user → updates password via NetUserSetInfo."""
+    def test_ensure_local_user_keeps_existing_password(self, mock_netapi32_fn):
+        """Existing user is accepted without changing its password."""
         mock_netapi32 = MagicMock()
         mock_netapi32.NetUserAdd.return_value = 2224  # NERR_UserExists
-        mock_netapi32.NetUserSetInfo.return_value = 0  # NERR_Success
         mock_netapi32_fn.return_value = mock_netapi32
 
         from qwenpaw.sandbox.windows_elevated_sandbox import (
@@ -414,14 +413,13 @@ class TestUserProvisioning:
 
         result = _ensure_local_user("qwenpaw_existing", "NewP@ss!")
         assert result is True
-        mock_netapi32.NetUserSetInfo.assert_called_once()
+        mock_netapi32.NetUserSetInfo.assert_not_called()
 
     @patch("qwenpaw.sandbox.windows_elevated_sandbox._get_netapi32")
-    def test_ensure_local_user_both_fail(self, mock_netapi32_fn):
-        """Both create and update fail → returns False."""
+    def test_ensure_local_user_create_failure(self, mock_netapi32_fn):
+        """Unexpected create failure returns False without password reset."""
         mock_netapi32 = MagicMock()
-        mock_netapi32.NetUserAdd.return_value = 2224
-        mock_netapi32.NetUserSetInfo.return_value = 5  # Access denied
+        mock_netapi32.NetUserAdd.return_value = 5  # Access denied
         mock_netapi32_fn.return_value = mock_netapi32
 
         from qwenpaw.sandbox.windows_elevated_sandbox import (
@@ -430,6 +428,7 @@ class TestUserProvisioning:
 
         result = _ensure_local_user("qwenpaw_fail", "P@ss!")
         assert result is False
+        mock_netapi32.NetUserSetInfo.assert_not_called()
 
     @patch("qwenpaw.sandbox.windows_elevated_sandbox._get_netapi32")
     def test_ensure_local_group_success(self, mock_netapi32_fn):
@@ -473,6 +472,73 @@ class TestUserProvisioning:
 
         result = _ensure_local_group("QwenpawUsers", "Test group")
         assert result is False
+
+    @patch(
+        "qwenpaw.sandbox.windows_elevated_sandbox._save_dedicated_users_state",
+    )
+    @patch(
+        "qwenpaw.sandbox.windows_elevated_sandbox._ensure_dedicated_user",
+    )
+    @patch(
+        "qwenpaw.sandbox.windows_elevated_sandbox._load_dedicated_users_state",
+        return_value={"version": 1, "users": {}, "deny_paths": []},
+    )
+    @patch("qwenpaw.sandbox.windows_elevated_sandbox._sandbox_file_lock")
+    @patch("qwenpaw.sandbox.windows_elevated_sandbox._get_kernel32")
+    @patch("qwenpaw.sandbox.windows_elevated_sandbox._string_to_sid")
+    @patch("qwenpaw.sandbox.windows_elevated_sandbox._add_allow_ace")
+    @patch("qwenpaw.sandbox.windows_elevated_sandbox._add_allow_read_ace")
+    @patch(
+        "qwenpaw.sandbox.windows_elevated_sandbox"
+        "._ensure_workspace_traverse_acls",
+    )
+    def test_dedicated_user_selected_by_network_policy(
+        self,
+        mock_traverse,
+        mock_allow_read,
+        mock_allow,
+        mock_string_to_sid,
+        mock_kernel32,
+        mock_lock,
+        mock_load,
+        mock_ensure_user,
+        mock_save,
+    ):
+        """Open and blocked network policies select different fixed users."""
+        from contextlib import nullcontext
+
+        from qwenpaw.sandbox.windows_elevated_sandbox import (
+            SANDBOX_NETWORK_USER,
+            SANDBOX_NO_NETWORK_USER,
+            _ensure_dedicated_users,
+        )
+
+        mock_lock.return_value = nullcontext()
+        mock_kernel32.return_value = MagicMock()
+        mock_string_to_sid.return_value = MagicMock()
+        mock_ensure_user.side_effect = [
+            ("net-pw", "S-1-net", r"C:\Users\qwenpaw_net"),
+            ("nonet-pw", "S-1-nonet", r"C:\Users\qwenpaw_nonet"),
+            ("net-pw", "S-1-net", r"C:\Users\qwenpaw_net"),
+            ("nonet-pw", "S-1-nonet", r"C:\Users\qwenpaw_nonet"),
+        ]
+
+        open_config = SandboxConfig(
+            mode=SandboxMode.WINDOWS,
+            workspace_dir=r"C:\project",
+            network_allow=["*"],
+        )
+        blocked_config = SandboxConfig(
+            mode=SandboxMode.WINDOWS,
+            workspace_dir=r"C:\project",
+            network_allow=[],
+        )
+
+        assert _ensure_dedicated_users(open_config)[0] == SANDBOX_NETWORK_USER
+        assert (
+            _ensure_dedicated_users(blocked_config)[0]
+            == SANDBOX_NO_NETWORK_USER
+        )
 
 
 # ============================================================================
@@ -586,7 +652,7 @@ class TestACLApplication:
         mock_deny_ace,
         mock_null_device,
     ):
-        """Workspace gets full access ACEs for both cap and user SIDs."""
+        """Per-instance metadata tracks only the capability workspace ACE."""
         mock_kernel32 = MagicMock()
         mock_kernel32_fn.return_value = mock_kernel32
         mock_str_to_sid.return_value = MagicMock()
@@ -604,16 +670,13 @@ class TestACLApplication:
 
         entries = _apply_all_acls(config, "S-1-5-21-cap", "S-1-5-21-user")
 
-        # Workspace should have allow_full for both cap and user
+        # Shared-user ACEs are persistent and managed outside this helper.
         ws_entries = [e for e in entries if e.path == r"C:\project"]
         assert any(
             e.access_mode == "allow_full" and e.sid_type == "cap"
             for e in ws_entries
         )
-        assert any(
-            e.access_mode == "allow_full" and e.sid_type == "user"
-            for e in ws_entries
-        )
+        assert not any(e.sid_type == "user" for e in ws_entries)
 
     @patch("qwenpaw.sandbox.windows_elevated_sandbox._allow_null_device")
     @patch("qwenpaw.sandbox.windows_elevated_sandbox._add_deny_all_ace")
@@ -654,7 +717,7 @@ class TestACLApplication:
         mock_deny_ace,
         mock_null_device,
     ):
-        """Read-only mount gets allow_read for both cap and user SIDs."""
+        """Read-only mount metadata contains only the capability ACE."""
         mock_kernel32 = MagicMock()
         mock_kernel32_fn.return_value = mock_kernel32
         mock_str_to_sid.return_value = MagicMock()
@@ -678,10 +741,7 @@ class TestACLApplication:
             e.access_mode == "allow_read" and e.sid_type == "cap"
             for e in mount_entries
         )
-        assert any(
-            e.access_mode == "allow_read" and e.sid_type == "user"
-            for e in mount_entries
-        )
+        assert not any(e.sid_type == "user" for e in mount_entries)
 
     @patch("qwenpaw.sandbox.windows_elevated_sandbox._allow_null_device")
     @patch("qwenpaw.sandbox.windows_elevated_sandbox._add_deny_all_ace")
@@ -722,7 +782,7 @@ class TestACLApplication:
         mock_deny_ace,
         mock_null_device,
     ):
-        """Deny paths get deny_all ACE for user SID."""
+        """Deny paths are managed persistently, outside instance ACLs."""
         mock_kernel32 = MagicMock()
         mock_kernel32_fn.return_value = mock_kernel32
         mock_str_to_sid.return_value = MagicMock()
@@ -743,9 +803,8 @@ class TestACLApplication:
         entries = _apply_all_acls(config, "S-1-5-21-cap", "S-1-5-21-user")
 
         deny_entries = [e for e in entries if e.access_mode == "deny_all"]
-        assert len(deny_entries) == 1
-        assert deny_entries[0].sid_type == "user"
-        assert r".ssh" in deny_entries[0].path
+        assert deny_entries == []
+        mock_deny_ace.assert_not_called()
 
     @patch("qwenpaw.sandbox.windows_elevated_sandbox._allow_null_device")
     @patch("qwenpaw.sandbox.windows_elevated_sandbox._add_deny_all_ace")
@@ -786,7 +845,7 @@ class TestACLApplication:
         mock_deny_ace,
         mock_null_device,
     ):
-        """Writable mount gets full access for both cap and user SIDs."""
+        """Writable mount metadata contains only the capability ACE."""
         mock_kernel32 = MagicMock()
         mock_kernel32_fn.return_value = mock_kernel32
         mock_str_to_sid.return_value = MagicMock()
@@ -810,10 +869,7 @@ class TestACLApplication:
             e.access_mode == "allow_full" and e.sid_type == "cap"
             for e in mount_entries
         )
-        assert any(
-            e.access_mode == "allow_full" and e.sid_type == "user"
-            for e in mount_entries
-        )
+        assert not any(e.sid_type == "user" for e in mount_entries)
 
 
 # ============================================================================
