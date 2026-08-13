@@ -68,14 +68,14 @@ from qwenpaw.sandbox import (
     SandboxMode,
     create_sandbox,
 )
-from qwenpaw.sandbox.windows_unelevated_sandbox import (
+from qwenpaw.sandbox.windows_sandbox_base import (
     _WC,
-    WindowsUnelevatedSandbox,
     _build_shell_command_line,
     _compute_config_fingerprint,
     _make_env_block,
     _make_random_cap_sid_string,
 )
+from qwenpaw.sandbox.windows_unelevated_sandbox import WindowsUnelevatedSandbox
 
 # ============================================================================
 # Factory routing (create_sandbox dispatches correctly)
@@ -87,7 +87,7 @@ class TestFactoryRouting:
 
     @patch("qwenpaw.sandbox.config.sys")
     @patch(
-        "qwenpaw.sandbox.windows_unelevated_sandbox._is_admin",
+        "qwenpaw.sandbox.windows_sandbox_base._is_admin",
         return_value=False,
     )
     def test_allow_read_all_non_admin_routes_to_unelevated(
@@ -324,8 +324,7 @@ class TestBaseEnvironment:
 
     @patch.dict("os.environ", {}, clear=True)
     @patch(
-        "qwenpaw.sandbox.windows_unelevated_sandbox."
-        "_get_python_install_dir",
+        "qwenpaw.sandbox.windows_unelevated_sandbox._get_python_install_dir",
         return_value=r"C:\QwenPaw\binaries\qwenpaw-backend",
     )
     def test_does_not_inject_pythonhome(self, mock_python_dir):

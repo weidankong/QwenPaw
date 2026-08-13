@@ -715,7 +715,7 @@ def create_sandbox(  # pylint: disable=too-many-return-statements
             )
 
             return WindowsAppContainerSandbox(config)
-        from .windows_unelevated_sandbox import _is_admin
+        from .windows_sandbox_base import _is_admin
 
         if _is_admin():
             from .windows_elevated_sandbox import WindowsElevatedSandbox

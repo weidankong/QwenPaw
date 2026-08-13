@@ -32,7 +32,7 @@ from qwenpaw.sandbox.windows_appcontainer_sandbox import (
     _find_reusable_container,
     _save_container_metadata,
 )
-from qwenpaw.sandbox.windows_unelevated_sandbox import _WC
+from qwenpaw.sandbox.windows_sandbox_base import _WC
 
 # ============================================================================
 # probe_sandbox_support() — platform routing
@@ -598,7 +598,7 @@ class TestFactoryAppContainer:
 
     @patch("qwenpaw.sandbox.config.sys")
     @patch(
-        "qwenpaw.sandbox.windows_unelevated_sandbox._is_admin",
+        "qwenpaw.sandbox.windows_sandbox_base._is_admin",
         return_value=True,
     )
     def test_create_sandbox_appcontainer_allow_read_all_true(

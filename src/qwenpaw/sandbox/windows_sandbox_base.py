@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import ctypes
 import ctypes.wintypes
+import datetime
 import hashlib
 import json
 import logging
@@ -25,6 +26,7 @@ import os
 import random
 import re
 import struct
+import subprocess
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -265,6 +267,14 @@ class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
     ]
 
 
+class _ACL_SIZE_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("AceCount", ctypes.wintypes.DWORD),
+        ("AclBytesInUse", ctypes.wintypes.DWORD),
+        ("AclBytesFree", ctypes.wintypes.DWORD),
+    ]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Shared: Pipe Output Decoding
 # ═══════════════════════════════════════════════════════════════════════════
@@ -381,6 +391,11 @@ def _is_admin() -> bool:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except (AttributeError, OSError):
         return False
+
+
+def _is_invalid_handle(h) -> bool:
+    """Returns True if a handle value is NULL or INVALID_HANDLE_VALUE."""
+    return not h or h == ctypes.c_void_p(-1).value
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1157,13 +1172,6 @@ def _remove_ace_by_sid_api(  # pylint: disable=too-many-branches
 
         try:
             # Get ACE count
-            class _ACL_SIZE_INFORMATION(ctypes.Structure):
-                _fields_ = [
-                    ("AceCount", ctypes.wintypes.DWORD),
-                    ("AclBytesInUse", ctypes.wintypes.DWORD),
-                    ("AclBytesFree", ctypes.wintypes.DWORD),
-                ]
-
             acl_info = _ACL_SIZE_INFORMATION()
             _AclSizeInformation = 2
             ok = advapi32.GetAclInformation(
@@ -1715,3 +1723,132 @@ class WindowsSandboxBase(ABC):
         if self._config.env_vars:
             env.update(self._config.env_vars)
         return env
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Shared: Subprocess Utilities
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _run_cmd_sync(
+    args: List[str],
+    timeout: int = 30,
+) -> Optional["subprocess.CompletedProcess"]:
+    """Runs a command synchronously with timeout.
+
+    Args:
+        args: Command and arguments list.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        CompletedProcess on success, None on failure or timeout.
+    """
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _run_powershell(
+    script: str,
+    timeout: int = 30,
+) -> "subprocess.CompletedProcess":
+    """Runs a PowerShell script synchronously.
+
+    Args:
+        script: PowerShell command string.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        CompletedProcess result.
+    """
+    return subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _verify_acl_present_sync(path: str, sid: str) -> bool:
+    """Checks that a SID appears in a path's DACL via icacls.
+
+    Used during sandbox reuse to validate that ACLs from a previous
+    instance are still intact.
+
+    Args:
+        path: Filesystem path to check.
+        sid: SID string to look for.
+
+    Returns:
+        True if the SID is present in the DACL output.
+    """
+    if not os.path.exists(path):
+        return False
+    try:
+        result = subprocess.run(
+            ["icacls", path],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    output = result.stdout.decode("utf-8", errors="replace")
+    if sid in output:
+        return True
+    if sid.upper() in output.upper():
+        return True
+    return False
+
+
+def _move_to_failed_cleanup(
+    meta: dict,
+    meta_file: Path,
+    reason: str,
+) -> None:
+    """Moves metadata to failed_cleanup/ when cleanup fails.
+
+    Shared by both elevated and unelevated sandbox shutdown cleanup.
+
+    Args:
+        meta: Sandbox metadata dict.
+        meta_file: Path to the original metadata file.
+        reason: Description of the cleanup failure.
+    """
+    failed_dir = _qwenpaw_state_dir / "failed_cleanup"
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    dest = failed_dir / meta_file.name
+    counter = 1
+    while dest.exists():
+        dest = failed_dir / f"{meta_file.stem}_{counter}.json"
+        counter += 1
+    meta["_cleanup_error"] = {
+        "reason": reason,
+        "timestamp": datetime.datetime.now().isoformat(),
+    }
+    try:
+        dest.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        return
+    try:
+        meta_file.unlink()
+    except OSError:
+        pass
+    logger.info("Cleanup failed, metadata preserved: %s", dest.name)

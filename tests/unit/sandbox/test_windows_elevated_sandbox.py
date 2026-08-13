@@ -81,7 +81,7 @@ from qwenpaw.sandbox.windows_elevated_sandbox import (
     _run_icacls_sync_local,
     _sandboxes_dir,
 )
-from qwenpaw.sandbox.windows_unelevated_sandbox import _WC
+from qwenpaw.sandbox.windows_sandbox_base import _WC
 
 # ============================================================================
 # Factory routing (create_sandbox dispatches correctly)
@@ -93,7 +93,7 @@ class TestFactoryRouting:
 
     @patch("qwenpaw.sandbox.config.sys")
     @patch(
-        "qwenpaw.sandbox.windows_unelevated_sandbox._is_admin",
+        "qwenpaw.sandbox.windows_sandbox_base._is_admin",
         return_value=True,
     )
     def test_allow_read_all_true_routes_to_restricted(

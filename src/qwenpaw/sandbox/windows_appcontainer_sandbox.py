@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import ExecutionResult, SandboxConfig
-from .windows_unelevated_sandbox import (
+from .windows_sandbox_base import (
     _PROCESS_INFORMATION,
     _SID_AND_ATTRIBUTES,
     _STARTUPINFOW,
@@ -37,6 +37,7 @@ from .windows_unelevated_sandbox import (
     _get_python_install_dir,
     _is_admin,
     _is_pid_alive,
+    _move_to_failed_cleanup,
     _read_pipe,
     _remove_acl_with_verify_sync,
     _set_path_ace,
@@ -884,39 +885,6 @@ class WindowsAppContainerSandbox(WindowsSandboxBase):
 _state_dir = (
     Path(os.environ.get("USERPROFILE", os.path.expanduser("~"))) / ".qwenpaw"
 )
-
-
-def _move_to_failed_cleanup(
-    meta: dict,
-    meta_file: Path,
-    reason: str,
-) -> None:
-    """Moves metadata to failed_cleanup/ when cleanup fails."""
-    import datetime
-
-    failed_dir = _state_dir / "failed_cleanup"
-    failed_dir.mkdir(parents=True, exist_ok=True)
-    dest = failed_dir / meta_file.name
-    counter = 1
-    while dest.exists():
-        dest = failed_dir / f"{meta_file.stem}_{counter}.json"
-        counter += 1
-    meta["_cleanup_error"] = {
-        "reason": reason,
-        "timestamp": datetime.datetime.now().isoformat(),
-    }
-    try:
-        dest.write_text(
-            json.dumps(meta, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except OSError:
-        return
-    try:
-        meta_file.unlink()
-    except OSError:
-        pass
-    logger.info("Cleanup failed, metadata preserved: %s", dest.name)
 
 
 def _cleanup_single_container(  # pylint: disable=R0912

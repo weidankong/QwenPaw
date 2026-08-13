@@ -52,10 +52,8 @@ from .windows_elevated_sandbox import (
 from .windows_elevated_sandbox import (
     shutdown_cleanup as _restricted_shutdown_cleanup,
 )
-from .windows_unelevated_sandbox import (
-    WindowsSandboxBase,
-    WindowsUnelevatedSandbox,
-)
+from .windows_sandbox_base import WindowsSandboxBase
+from .windows_unelevated_sandbox import WindowsUnelevatedSandbox
 from .windows_unelevated_sandbox import (
     shutdown_cleanup as _unelevated_shutdown_cleanup,
 )

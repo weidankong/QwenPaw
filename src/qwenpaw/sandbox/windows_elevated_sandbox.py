@@ -20,14 +20,14 @@ import json
 import logging
 import os
 import secrets
-import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import ExecutionResult, SandboxConfig
-from .windows_unelevated_sandbox import (
+from .windows_sandbox_base import (
+    _ACL_SIZE_INFORMATION,
     _PROCESS_INFORMATION,
     _SID_AND_ATTRIBUTES,
     _STARTUPINFOW,
@@ -44,23 +44,28 @@ from .windows_unelevated_sandbox import (
     _get_logon_sid_bytes,
     _get_python_install_dir,
     _is_admin,
+    _is_invalid_handle,
     _iter_orphaned_metadata,
     _make_env_block,
     _make_random_cap_sid_string,
+    _move_to_failed_cleanup,
     _qwenpaw_state_dir,
     _remove_acl_with_verify_sync,
+    _run_cmd_sync,
+    _run_powershell,
     _sandbox_file_lock,
     _save_sandbox_metadata,
     _set_default_dacl,
     _set_path_ace,
     _sid_to_string,
     _string_to_sid,
+    _verify_acl_present_sync,
     _wait_and_read_process,
 )
-from .windows_unelevated_sandbox import (
+from .windows_sandbox_base import (
     _get_advapi32 as _get_shared_advapi32,
 )
-from .windows_unelevated_sandbox import (
+from .windows_sandbox_base import (
     _get_kernel32 as _get_shared_kernel32,
 )
 
@@ -1048,19 +1053,6 @@ _WRITE_DAC = 0x00040000
 _READ_CONTROL = 0x00020000
 _SECURITY_DESCRIPTOR_REVISION = 1
 _SD_ABS_SIZE = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 20
-
-
-class _ACL_SIZE_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("AceCount", ctypes.wintypes.DWORD),
-        ("AclBytesInUse", ctypes.wintypes.DWORD),
-        ("AclBytesFree", ctypes.wintypes.DWORD),
-    ]
-
-
-def _is_invalid_handle(h) -> bool:
-    """Returns True if a handle value is NULL or INVALID_HANDLE_VALUE."""
-    return not h or h == ctypes.c_void_p(-1).value
 
 
 def _open_dir_handle(path: str):
@@ -2505,41 +2497,6 @@ class WindowsElevatedSandbox(WindowsSandboxBase):
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _run_powershell(
-    script: str,
-    timeout: int = 30,
-) -> "subprocess.CompletedProcess":
-    return subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ],
-        capture_output=True,
-        timeout=timeout,
-        check=False,
-    )
-
-
-def _run_cmd_sync(
-    args: List[str],
-    timeout: int = 30,
-) -> Optional["subprocess.CompletedProcess"]:
-    try:
-        return subprocess.run(
-            args,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-
 def _remove_firewall_rules_sync(username: str) -> bool:
     """Removes inbound/outbound firewall block rules for a sandbox user."""
     rule_name_out = f"QwenPaw_Block_{username}_Out"
@@ -2805,39 +2762,6 @@ def _remove_acls_from_metadata(
     return failed
 
 
-def _move_to_failed_cleanup_elevated(
-    meta: dict,
-    meta_file: Path,
-    reason: str,
-) -> None:
-    """Moves metadata to failed_cleanup/ when cleanup fails."""
-    import datetime
-
-    failed_dir = _qwenpaw_state_dir / "failed_cleanup"
-    failed_dir.mkdir(parents=True, exist_ok=True)
-    dest = failed_dir / meta_file.name
-    counter = 1
-    while dest.exists():
-        dest = failed_dir / f"{meta_file.stem}_{counter}.json"
-        counter += 1
-    meta["_cleanup_error"] = {
-        "reason": reason,
-        "timestamp": datetime.datetime.now().isoformat(),
-    }
-    try:
-        dest.write_text(
-            json.dumps(meta, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except OSError:
-        return
-    try:
-        meta_file.unlink()
-    except OSError:
-        pass
-    logger.info("Cleanup failed, metadata preserved: %s", dest.name)
-
-
 def _cleanup_from_metadata(  # pylint: disable=R0912
     meta: dict,
     meta_file: Path,
@@ -2891,7 +2815,7 @@ def _cleanup_from_metadata(  # pylint: disable=R0912
         failures.append("profile directory removal failed")
 
     if failures:
-        _move_to_failed_cleanup_elevated(
+        _move_to_failed_cleanup(
             meta,
             meta_file,
             "; ".join(failures),
