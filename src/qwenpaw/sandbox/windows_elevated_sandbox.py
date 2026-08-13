@@ -19,8 +19,7 @@ import ctypes.wintypes
 import json
 import logging
 import os
-import random
-import struct
+import secrets
 import subprocess
 import sys
 import time
@@ -38,11 +37,9 @@ from .windows_unelevated_sandbox import (
     _build_explicit_access,
     _build_shell_command_line,
     _compute_config_fingerprint,
-    _copy_sid_from_ptr,
     _create_job_object,
-    _create_well_known_sid,
-    _create_restricted_token as _create_unelevated_restricted_token,
     _create_stdio_pipes,
+    _create_well_known_sid,
     _enable_privilege,
     _get_logon_sid_bytes,
     _get_python_install_dir,
@@ -80,9 +77,6 @@ SANDBOX_NO_NETWORK_USER = "qwenpaw_nonet"
 
 _DEDICATED_USERS_STATE_ID = "elevated_users"
 _DEDICATED_USERS_STATE_VERSION = 1
-
-_LUA_TOKEN = 0x04
-_TokenUser = 1
 
 # CreateProcessWithTokenW logon flags
 _LOGON_WITH_PROFILE = 0x00000001
@@ -343,7 +337,7 @@ def _random_password(length: int = 24) -> str:
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
         "0123456789!@#$%^&*()-_=+"
     )
-    return "".join(random.choice(chars) for _ in range(length))
+    return "".join(secrets.choice(chars) for _ in range(length))
 
 
 class _DATA_BLOB(ctypes.Structure):
@@ -885,70 +879,26 @@ def _get_profile_directory(h_token: ctypes.wintypes.HANDLE) -> Optional[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Token creation (module-specific — different params from unelevated)
+# ACL management via Win32 API (module-specific — calls _ensure_privileges)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _get_token_info_raw_legacy(
-    h_token: ctypes.wintypes.HANDLE,
-    info_class: int,
-    label: str,
-) -> ctypes.Array:
-    advapi32 = _get_advapi32()
-    needed = ctypes.c_uint32(0)
-    advapi32.GetTokenInformation(
-        h_token,
-        info_class,
-        None,
-        0,
-        ctypes.byref(needed),
-    )
-    if needed.value == 0:
-        raise OSError(f"GetTokenInformation({label}) size query returned 0")
-    buf = (ctypes.c_ubyte * needed.value)()
-    ok = advapi32.GetTokenInformation(
-        h_token,
-        info_class,
-        buf,
-        needed.value,
-        ctypes.byref(needed),
-    )
-    if not ok:
-        raise OSError(
-            f"GetTokenInformation({label}) failed: "
-            f"error={ctypes.get_last_error()}",
-        )
-    return buf
-
-
-def _get_user_sid_bytes_legacy(h_token: ctypes.wintypes.HANDLE) -> bytes:
-    buf = _get_token_info_raw_legacy(h_token, _TokenUser, "TokenUser")
-
-    ptr_size = ctypes.sizeof(ctypes.c_void_p)
-    if ptr_size == 8:
-        sid_ptr_val = struct.unpack_from("<Q", bytes(buf), 0)[0]
-    else:
-        sid_ptr_val = struct.unpack_from("<I", bytes(buf), 0)[0]
-
-    sid_bytes = _copy_sid_from_ptr(sid_ptr_val)
-    if not sid_bytes:
-        raise OSError("GetLengthSid(TokenUser) failed")
-    return sid_bytes
-
-
-def _create_restricted_token_legacy(
+def _create_restricted_token(
     h_base_token: ctypes.wintypes.HANDLE,
-    cap_sid_strings: List[str],
+    cap_sid_string: str,
+    user_sid_string: str,
 ) -> ctypes.wintypes.HANDLE:
     """Creates a WRITE_RESTRICTED token for the elevated sandbox.
 
-    The restricting SID list is
-    ``[capabilities…, user_sid, logon_sid, Everyone]``.
+    Restricting SID list: ``[cap_sid, user_sid, logon_sid, Everyone]``.
+    The user SID must be included so that DLL loading and other read/write
+    operations on objects owned by the sandbox user succeed under the
+    WRITE_RESTRICTED check.
 
     Args:
         h_base_token: Handle to the sandbox user's logon token.
-        cap_sid_strings: Capability SID strings to include in the
-            restricting list.
+        cap_sid_string: Capability SID string to gate writes.
+        user_sid_string: SID string of the sandbox user account.
 
     Returns:
         Handle to the new restricted token.
@@ -960,37 +910,25 @@ def _create_restricted_token_legacy(
     kernel32 = _get_kernel32()
 
     logon_sid_bytes = _get_logon_sid_bytes(h_base_token)
-    user_sid_bytes = _get_user_sid_bytes_legacy(h_base_token)
-
-    sid_buffers: List[Any] = []
-    entries: List[_SID_AND_ATTRIBUTES] = []
-    cap_psids: List[ctypes.c_void_p] = []
-
-    for sid_str in cap_sid_strings:
-        psid = _string_to_sid(sid_str)
-        cap_psids.append(psid)
-        entries.append(_SID_AND_ATTRIBUTES(Sid=psid, Attributes=0))
-
-    user_buf = (ctypes.c_ubyte * len(user_sid_bytes))(*user_sid_bytes)
-    sid_buffers.append(user_buf)
-    user_ptr = ctypes.cast(user_buf, ctypes.c_void_p)
-    entries.append(_SID_AND_ATTRIBUTES(Sid=user_ptr, Attributes=0))
-
     logon_buf = (ctypes.c_ubyte * len(logon_sid_bytes))(*logon_sid_bytes)
-    sid_buffers.append(logon_buf)
     logon_ptr = ctypes.cast(logon_buf, ctypes.c_void_p)
-    entries.append(_SID_AND_ATTRIBUTES(Sid=logon_ptr, Attributes=0))
 
-    _WinWorldSid = 1
-    everyone_bytes = _create_well_known_sid(_WinWorldSid)
+    everyone_bytes = _create_well_known_sid(_WC.WinWorldSid)
     everyone_buf = (ctypes.c_ubyte * len(everyone_bytes))(*everyone_bytes)
-    sid_buffers.append(everyone_buf)
     everyone_ptr = ctypes.cast(everyone_buf, ctypes.c_void_p)
-    entries.append(_SID_AND_ATTRIBUTES(Sid=everyone_ptr, Attributes=0))
 
-    array_type = _SID_AND_ATTRIBUTES * len(entries)
-    restricting_sids = array_type(*entries)
-    flags = _WC.DISABLE_MAX_PRIVILEGE | _LUA_TOKEN | _WC.WRITE_RESTRICTED
+    cap_psid = _string_to_sid(cap_sid_string)
+    user_psid = _string_to_sid(user_sid_string)
+
+    entries = [
+        _SID_AND_ATTRIBUTES(Sid=cap_psid, Attributes=0),
+        _SID_AND_ATTRIBUTES(Sid=user_psid, Attributes=0),
+        _SID_AND_ATTRIBUTES(Sid=logon_ptr, Attributes=0),
+        _SID_AND_ATTRIBUTES(Sid=everyone_ptr, Attributes=0),
+    ]
+    arr = (_SID_AND_ATTRIBUTES * len(entries))(*entries)
+
+    flags = _WC.DISABLE_MAX_PRIVILEGE | _WC.WRITE_RESTRICTED
     new_token = ctypes.wintypes.HANDLE()
     ok = advapi32.CreateRestrictedToken(
         h_base_token,
@@ -1000,51 +938,31 @@ def _create_restricted_token_legacy(
         0,
         None,
         len(entries),
-        ctypes.cast(restricting_sids, ctypes.POINTER(_SID_AND_ATTRIBUTES)),
+        ctypes.cast(arr, ctypes.c_void_p),
         ctypes.byref(new_token),
     )
     if not ok:
-        for psid in cap_psids:
-            kernel32.LocalFree(psid)
+        kernel32.LocalFree(cap_psid)
+        kernel32.LocalFree(user_psid)
         raise OSError(
             f"CreateRestrictedToken failed: error={ctypes.get_last_error()}",
         )
 
     try:
-        dacl_sids = [logon_ptr] + cap_psids
-        _set_default_dacl(new_token, dacl_sids)
-        _enable_privilege(new_token, _WC.SE_CHANGE_NOTIFY_NAME)
+        _set_default_dacl(
+            new_token,
+            [cap_psid, user_psid, logon_ptr, everyone_ptr],
+        )
+        if not _enable_privilege(new_token, _WC.SE_CHANGE_NOTIFY_NAME):
+            logger.warning("Failed to enable SeChangeNotifyPrivilege on token")
     except Exception:
         kernel32.CloseHandle(new_token)
         raise
     finally:
-        for psid in cap_psids:
-            kernel32.LocalFree(psid)
+        kernel32.LocalFree(cap_psid)
+        kernel32.LocalFree(user_psid)
 
     return new_token
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ACL management via Win32 API (module-specific — calls _ensure_privileges)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def _create_restricted_token(
-    h_base_token: ctypes.wintypes.HANDLE,
-    cap_sid_strings: List[str],
-) -> ctypes.wintypes.HANDLE:
-    """Creates the capability-gated token used by the unelevated backend."""
-    if len(cap_sid_strings) != 1:
-        raise ValueError(
-            "Elevated sandbox requires exactly one capability SID",
-        )
-    kernel32 = _get_kernel32()
-    token, cap_psid = _create_unelevated_restricted_token(
-        h_base_token,
-        cap_sid_strings[0],
-    )
-    kernel32.LocalFree(cap_psid)
-    return token
 
 
 _privileges_enabled = False
@@ -1122,35 +1040,36 @@ _ACL_DENY_ALL = _ACL_FULL_ACCESS | _WC.GENERIC_ALL
 # READ_CONTROL (0x00020000) + SYNCHRONIZE (0x00100000)
 _ACL_TRAVERSE = 0x00120021
 
+# Shared filesystem constants
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_OPEN_EXISTING = 3
+_FILE_SHARE_ALL = 0x07
+_WRITE_DAC = 0x00040000
+_READ_CONTROL = 0x00020000
+_SECURITY_DESCRIPTOR_REVISION = 1
+_SD_ABS_SIZE = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 20
 
-def _add_traverse_ace(  # pylint: disable=too-many-return-statements
-    path: str,
-    psid: ctypes.c_void_p,
-) -> bool:
-    """Adds a non-inheritable traverse ACE on a directory.
 
-    Uses NtSetSecurityObject.
+class _ACL_SIZE_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("AceCount", ctypes.wintypes.DWORD),
+        ("AclBytesInUse", ctypes.wintypes.DWORD),
+        ("AclBytesFree", ctypes.wintypes.DWORD),
+    ]
 
-    Uses the NT native API to directly write the modified DACL, bypassing
-    the Win32 layer's expensive recursive inheritance propagation.  This is
-    O(1) regardless of how many children the directory contains.
 
-    Grants FILE_LIST_DIRECTORY | FILE_TRAVERSE | READ_CONTROL |
-    SYNCHRONIZE — the minimum for PowerShell/.NET path validation.
+def _is_invalid_handle(h) -> bool:
+    """Returns True if a handle value is NULL or INVALID_HANDLE_VALUE."""
+    return not h or h == ctypes.c_void_p(-1).value
+
+
+def _open_dir_handle(path: str):
+    """Opens a directory handle with WRITE_DAC | READ_CONTROL.
+
+    Returns:
+        Handle value, or None on failure.
     """
-    _ensure_privileges()
-
-    advapi32 = _get_advapi32()
     kernel32 = _get_kernel32()
-    ntdll = _get_ntdll()
-
-    # Open directory handle with WRITE_DAC | READ_CONTROL
-    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
-    _OPEN_EXISTING = 3
-    _FILE_SHARE_ALL = 0x07
-    _WRITE_DAC = 0x00040000
-    _READ_CONTROL = 0x00020000
-
     h_dir = kernel32.CreateFileW(
         ctypes.c_wchar_p(path),
         _WRITE_DAC | _READ_CONTROL,
@@ -1160,7 +1079,85 @@ def _add_traverse_ace(  # pylint: disable=too-many-return-statements
         _FILE_FLAG_BACKUP_SEMANTICS,
         None,
     )
-    if not h_dir or h_dir == ctypes.c_void_p(-1).value:
+    if _is_invalid_handle(h_dir):
+        return None
+    return h_dir
+
+
+def _write_dacl_via_nt(
+    h_dir,
+    p_dacl: ctypes.c_void_p,
+) -> bool:
+    """Writes a DACL to a directory handle via NtSetSecurityObject.
+
+    Builds a self-relative security descriptor from the given DACL and
+    applies it directly via the NT native API, bypassing expensive
+    recursive inheritance propagation.
+
+    Args:
+        h_dir: Directory handle opened with WRITE_DAC.
+        p_dacl: Pointer to the ACL to write.
+
+    Returns:
+        True on success.
+    """
+    advapi32 = _get_advapi32()
+    ntdll = _get_ntdll()
+
+    sd_abs = (ctypes.c_ubyte * _SD_ABS_SIZE)()
+    advapi32.InitializeSecurityDescriptor(
+        ctypes.cast(sd_abs, ctypes.c_void_p),
+        _SECURITY_DESCRIPTOR_REVISION,
+    )
+    advapi32.SetSecurityDescriptorDacl(
+        ctypes.cast(sd_abs, ctypes.c_void_p),
+        True,
+        p_dacl,
+        False,
+    )
+
+    sr_size = ctypes.wintypes.DWORD(0)
+    advapi32.MakeSelfRelativeSD(
+        ctypes.cast(sd_abs, ctypes.c_void_p),
+        None,
+        ctypes.byref(sr_size),
+    )
+    if sr_size.value == 0:
+        return False
+
+    sd_sr = (ctypes.c_ubyte * sr_size.value)()
+    ok = advapi32.MakeSelfRelativeSD(
+        ctypes.cast(sd_abs, ctypes.c_void_p),
+        ctypes.cast(sd_sr, ctypes.c_void_p),
+        ctypes.byref(sr_size),
+    )
+    if not ok:
+        return False
+
+    status = ntdll.NtSetSecurityObject(
+        h_dir,
+        _WC.DACL_SECURITY_INFORMATION,
+        ctypes.cast(sd_sr, ctypes.c_void_p),
+    )
+    return status == 0
+
+
+def _add_traverse_ace(
+    path: str,
+    psid: ctypes.c_void_p,
+) -> bool:
+    """Adds a non-inheritable traverse ACE on a directory.
+
+    Uses NtSetSecurityObject to bypass expensive recursive inheritance
+    propagation.  O(1) regardless of child count.
+    """
+    _ensure_privileges()
+
+    advapi32 = _get_advapi32()
+    kernel32 = _get_kernel32()
+
+    h_dir = _open_dir_handle(path)
+    if h_dir is None:
         logger.warning(
             "_add_traverse_ace: CreateFileW(%s) failed: err=%d",
             path,
@@ -1169,7 +1166,6 @@ def _add_traverse_ace(  # pylint: disable=too-many-return-statements
         return False
 
     try:
-        # Read existing DACL
         p_sd = ctypes.c_void_p()
         p_dacl = ctypes.c_void_p()
         rc = advapi32.GetSecurityInfo(
@@ -1191,13 +1187,7 @@ def _add_traverse_ace(  # pylint: disable=too-many-return-statements
             return False
 
         try:
-            # Build and merge the new ACE
-            ea = _build_explicit_access(
-                psid,
-                _ACL_TRAVERSE,
-                _WC.SET_ACCESS,
-                0,
-            )
+            ea = _build_explicit_access(psid, _ACL_TRAVERSE, _WC.SET_ACCESS, 0)
             new_dacl = ctypes.c_void_p()
             rc2 = advapi32.SetEntriesInAclW(
                 1,
@@ -1214,61 +1204,13 @@ def _add_traverse_ace(  # pylint: disable=too-many-return-statements
                 return False
 
             try:
-                # Build self-relative SD for NtSetSecurityObject
-                _SECURITY_DESCRIPTOR_REVISION = 1
-                sd_size = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 20
-                sd_abs = (ctypes.c_ubyte * sd_size)()
-                advapi32.InitializeSecurityDescriptor(
-                    ctypes.cast(sd_abs, ctypes.c_void_p),
-                    _SECURITY_DESCRIPTOR_REVISION,
-                )
-                advapi32.SetSecurityDescriptorDacl(
-                    ctypes.cast(sd_abs, ctypes.c_void_p),
-                    True,
-                    new_dacl,
-                    False,
-                )
-
-                sr_size = ctypes.wintypes.DWORD(0)
-                advapi32.MakeSelfRelativeSD(
-                    ctypes.cast(sd_abs, ctypes.c_void_p),
-                    None,
-                    ctypes.byref(sr_size),
-                )
-                if sr_size.value == 0:
+                result = _write_dacl_via_nt(h_dir, new_dacl)
+                if not result:
                     logger.warning(
-                        "_add_traverse_ace: "
-                        "MakeSelfRelativeSD size query failed",
-                    )
-                    return False
-
-                sd_sr = (ctypes.c_ubyte * sr_size.value)()
-                ok = advapi32.MakeSelfRelativeSD(
-                    ctypes.cast(sd_abs, ctypes.c_void_p),
-                    ctypes.cast(sd_sr, ctypes.c_void_p),
-                    ctypes.byref(sr_size),
-                )
-                if not ok:
-                    logger.warning(
-                        "_add_traverse_ace: MakeSelfRelativeSD failed",
-                    )
-                    return False
-
-                # Write directly via NT API (no inheritance propagation)
-                status = ntdll.NtSetSecurityObject(
-                    h_dir,
-                    _WC.DACL_SECURITY_INFORMATION,
-                    ctypes.cast(sd_sr, ctypes.c_void_p),
-                )
-                if status != 0:
-                    logger.warning(
-                        "_add_traverse_ace: NtSetSecurityObject(%s) failed: "
-                        "NTSTATUS=0x%08X",
+                        "_add_traverse_ace: _write_dacl_via_nt(%s) failed",
                         path,
-                        status & 0xFFFFFFFF,
                     )
-                    return False
-                return True
+                return result
             finally:
                 if new_dacl:
                     kernel32.LocalFree(new_dacl)
@@ -1279,21 +1221,14 @@ def _add_traverse_ace(  # pylint: disable=too-many-return-statements
         kernel32.CloseHandle(h_dir)
 
 
-def _remove_traverse_ace(  # pylint: disable=R0911,R0912,R0915
+def _remove_traverse_ace(
     path: str,
     sid_string: str,
 ) -> bool:
     """Removes traverse ACEs for a SID from a directory.
 
-    Uses NtSetSecurityObject.
-
-    Uses the NT native API to write the modified DACL directly, avoiding
-    the expensive recursive inheritance propagation triggered by
-    SetNamedSecurityInfoW.
-
-    Args:
-        path: Filesystem path to clean.
-        sid_string: SID string to remove from the DACL.
+    Uses NtSetSecurityObject to bypass expensive recursive inheritance
+    propagation.
 
     Returns:
         True if the SID was removed or the path does not exist.
@@ -1305,24 +1240,9 @@ def _remove_traverse_ace(  # pylint: disable=R0911,R0912,R0915
 
     advapi32 = _get_advapi32()
     kernel32 = _get_kernel32()
-    ntdll = _get_ntdll()
 
-    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
-    _OPEN_EXISTING = 3
-    _FILE_SHARE_ALL = 0x07
-    _WRITE_DAC = 0x00040000
-    _READ_CONTROL = 0x00020000
-
-    h_dir = kernel32.CreateFileW(
-        ctypes.c_wchar_p(path),
-        _WRITE_DAC | _READ_CONTROL,
-        _FILE_SHARE_ALL,
-        None,
-        _OPEN_EXISTING,
-        _FILE_FLAG_BACKUP_SEMANTICS,
-        None,
-    )
-    if not h_dir or h_dir == ctypes.c_void_p(-1).value:
+    h_dir = _open_dir_handle(path)
+    if h_dir is None:
         logger.warning(
             "_remove_traverse_ace: CreateFileW(%s) failed: err=%d",
             path,
@@ -1331,7 +1251,6 @@ def _remove_traverse_ace(  # pylint: disable=R0911,R0912,R0915
         return False
 
     try:
-        # Read existing DACL
         p_sd = ctypes.c_void_p()
         p_dacl = ctypes.c_void_p()
         rc = advapi32.GetSecurityInfo(
@@ -1353,17 +1272,8 @@ def _remove_traverse_ace(  # pylint: disable=R0911,R0912,R0915
             return False
 
         try:
-            # Resolve SID string to pointer for comparison
             psid_target = _string_to_sid(sid_string)
             try:
-                # Find and delete matching ACEs
-                class _ACL_SIZE_INFORMATION(ctypes.Structure):
-                    _fields_ = [
-                        ("AceCount", ctypes.wintypes.DWORD),
-                        ("AclBytesInUse", ctypes.wintypes.DWORD),
-                        ("AclBytesFree", ctypes.wintypes.DWORD),
-                    ]
-
                 acl_info = _ACL_SIZE_INFORMATION()
                 ok = advapi32.GetAclInformation(
                     p_dacl,
@@ -1394,54 +1304,13 @@ def _remove_traverse_ace(  # pylint: disable=R0911,R0912,R0915
                 for idx in reversed(to_delete):
                     advapi32.DeleteAce(p_dacl, idx)
 
-                # Build self-relative SD and write via NtSetSecurityObject
-                _SECURITY_DESCRIPTOR_REVISION = 1
-                sd_size = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 20
-                sd_abs = (ctypes.c_ubyte * sd_size)()
-                advapi32.InitializeSecurityDescriptor(
-                    ctypes.cast(sd_abs, ctypes.c_void_p),
-                    _SECURITY_DESCRIPTOR_REVISION,
-                )
-                advapi32.SetSecurityDescriptorDacl(
-                    ctypes.cast(sd_abs, ctypes.c_void_p),
-                    True,
-                    p_dacl,
-                    False,
-                )
-
-                sr_size = ctypes.wintypes.DWORD(0)
-                advapi32.MakeSelfRelativeSD(
-                    ctypes.cast(sd_abs, ctypes.c_void_p),
-                    None,
-                    ctypes.byref(sr_size),
-                )
-                if sr_size.value == 0:
-                    return False
-
-                sd_sr = (ctypes.c_ubyte * sr_size.value)()
-                ok = advapi32.MakeSelfRelativeSD(
-                    ctypes.cast(sd_abs, ctypes.c_void_p),
-                    ctypes.cast(sd_sr, ctypes.c_void_p),
-                    ctypes.byref(sr_size),
-                )
-                if not ok:
-                    return False
-
-                status = ntdll.NtSetSecurityObject(
-                    h_dir,
-                    _WC.DACL_SECURITY_INFORMATION,
-                    ctypes.cast(sd_sr, ctypes.c_void_p),
-                )
-                if status != 0:
+                result = _write_dacl_via_nt(h_dir, p_dacl)
+                if not result:
                     logger.warning(
-                        "_remove_traverse_ace: "
-                        "NtSetSecurityObject(%s) failed: "
-                        "NTSTATUS=0x%08X",
+                        "_remove_traverse_ace: _write_dacl_via_nt(%s) failed",
                         path,
-                        status & 0xFFFFFFFF,
                     )
-                    return False
-                return True
+                return result
             finally:
                 kernel32.LocalFree(psid_target)
         finally:
@@ -1523,21 +1392,12 @@ def _check_any_sid_in_dacl(
         return False
 
     try:
-
-        class _ACL_SIZE_INFORMATION(ctypes.Structure):
-            _fields_ = [
-                ("AceCount", ctypes.wintypes.DWORD),
-                ("AclBytesInUse", ctypes.wintypes.DWORD),
-                ("AclBytesFree", ctypes.wintypes.DWORD),
-            ]
-
         acl_info = _ACL_SIZE_INFORMATION()
-        _AclSizeInformation = 2
         ok = advapi32.GetAclInformation(
             p_dacl,
             ctypes.byref(acl_info),
             ctypes.sizeof(acl_info),
-            _AclSizeInformation,
+            2,
         )
         if not ok:
             return False
@@ -1581,17 +1441,16 @@ def _allow_null_device(psid: ctypes.c_void_p) -> None:
     kernel32 = _get_kernel32()
     advapi32 = _get_advapi32()
 
-    desired = 0x00020000 | 0x00040000
     h = kernel32.CreateFileW(
         ctypes.c_wchar_p(r"\\.\NUL"),
-        desired,
-        0x00000001 | 0x00000002,
+        _READ_CONTROL | _WRITE_DAC,
+        _FILE_SHARE_ALL,
         None,
-        3,
-        0x00000080,
+        _OPEN_EXISTING,
+        0x00000080,  # FILE_ATTRIBUTE_NORMAL
         0,
     )
-    if not h or h == ctypes.c_void_p(-1).value:
+    if _is_invalid_handle(h):
         return
 
     _SE_KERNEL_OBJECT = 6
@@ -2002,9 +1861,7 @@ def _grant_object_access(  # pylint: disable=too-many-return-statements
         )
         return
 
-    _SECURITY_DESCRIPTOR_REVISION = 1
-    sd_size = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 20
-    new_sd = (ctypes.c_ubyte * sd_size)()
+    new_sd = (ctypes.c_ubyte * _SD_ABS_SIZE)()
     ok = advapi32.InitializeSecurityDescriptor(
         ctypes.cast(new_sd, ctypes.c_void_p),
         _SECURITY_DESCRIPTOR_REVISION,
@@ -2313,7 +2170,7 @@ def _restore_from_metadata(
 
         cap_sid = meta["cap_sid"]
 
-        h_token = _create_restricted_token(h_user_token, [cap_sid])
+        h_token = _create_restricted_token(h_user_token, cap_sid, user_sid)
 
         acl_entries = [
             _AclEntry(e["path"], e["access_mode"], e["sid_type"])
@@ -2374,7 +2231,7 @@ def _create_new_sandbox(
             kernel32.LocalFree(cap_psid)
             kernel32.LocalFree(user_psid)
 
-    h_token = _create_restricted_token(h_user_token, [cap_sid])
+    h_token = _create_restricted_token(h_user_token, cap_sid, user_sid_string)
 
     meta = {
         "sandbox_id": sandbox_id,
@@ -2514,7 +2371,7 @@ class WindowsElevatedSandbox(WindowsSandboxBase):
         env["TEMP"] = f"{sandbox_profile}\\AppData\\Local\\Temp"
         env["TMP"] = f"{sandbox_profile}\\AppData\\Local\\Temp"
         env["HOMEDRIVE"] = sys_drive
-        env["HOMEPATH"] = sandbox_profile[len(sys_drive):]
+        env["HOMEPATH"] = sandbox_profile[len(sys_drive) :]
 
         try:
             (
@@ -2602,9 +2459,18 @@ class WindowsElevatedSandbox(WindowsSandboxBase):
                 kernel32.TerminateJobObject(self._job_handle, 1)
             except OSError:
                 pass
+            try:
+                kernel32.CloseHandle(self._job_handle)
+            except OSError:
+                pass
             self._job_handle = None
             self._process_id = None
-            self._process_handle = None
+            if self._process_handle is not None:
+                try:
+                    kernel32.CloseHandle(self._process_handle)
+                except OSError:
+                    pass
+                self._process_handle = None
         elif self._process_id is not None:
             try:
                 _PROCESS_TERMINATE = 0x0001
@@ -2613,13 +2479,18 @@ class WindowsElevatedSandbox(WindowsSandboxBase):
                     False,
                     self._process_id,
                 )
-                if h and h != ctypes.c_void_p(-1).value:
+                if not _is_invalid_handle(h):
                     kernel32.TerminateProcess(h, 1)
                     kernel32.CloseHandle(h)
             except OSError:
                 pass
             self._process_id = None
-            self._process_handle = None
+            if self._process_handle is not None:
+                try:
+                    kernel32.CloseHandle(self._process_handle)
+                except OSError:
+                    pass
+                self._process_handle = None
 
         if self._instance is not None:
             await _release_sandbox(self._instance)
